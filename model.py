@@ -9,8 +9,57 @@ from torch import Tensor, nn
 logger = logging.getLogger(__name__)
 
 
+def get_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def rotate_half(x: Tensor) -> Tensor:
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+
+class RotaryEmbedding(nn.Module):
+    # Relative position encoding via rotation of Q/K, shared across all layers.
+    # Music depends on relative distances between notes, hence RoPE over absolute PE.
+    def __init__(
+        self, head_dim: int, max_seq_len: int, base: float = 10000.0
+    ) -> None:
+        super().__init__()
+        assert head_dim % 2 == 0, f"Got head_dim={head_dim}"
+
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+        )
+        positions = torch.arange(max_seq_len, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+
+    def forward(self, seq_len: int) -> tuple[Tensor, Tensor]:
+        return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
+
+
+def apply_rotary(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    assert x.ndim == 4, f"Got {x.shape}"
+    cos = cos.to(x.dtype)[None, None, :, :]
+    sin = sin.to(x.dtype)[None, None, :, :]
+    return x * cos + rotate_half(x) * sin
+
+
 class CausalSelfAttention(nn.Module):
-    def __init__(self, d_model: int, nhead: int, dropout: float) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dropout: float,
+        rotary: RotaryEmbedding,
+    ) -> None:
         super().__init__()
         assert d_model % nhead == 0, f"Got d_model={d_model}, nhead={nhead}"
 
@@ -18,6 +67,7 @@ class CausalSelfAttention(nn.Module):
         self.nhead = nhead
         self.head_dim = d_model // nhead
         self.dropout = dropout
+        self.rotary = rotary
 
         self.qkv_proj = nn.Linear(d_model, 3 * d_model)
         self.out_proj = nn.Linear(d_model, d_model)
@@ -34,6 +84,10 @@ class CausalSelfAttention(nn.Module):
         q = q.view(batch_size, seq_len, self.nhead, self.head_dim).transpose(1, 2)
         k = k.view(batch_size, seq_len, self.nhead, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, seq_len, self.nhead, self.head_dim).transpose(1, 2)
+
+        cos, sin = self.rotary(seq_len)
+        q = apply_rotary(q, cos, sin)
+        k = apply_rotary(k, cos, sin)
 
         attn = F.scaled_dot_product_attention(
             q,
@@ -56,10 +110,17 @@ class CausalSelfAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, nhead: int, d_ff: int, dropout: float) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        d_ff: int,
+        dropout: float,
+        rotary: RotaryEmbedding,
+    ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
-        self.attn = CausalSelfAttention(d_model, nhead, dropout)
+        self.attn = CausalSelfAttention(d_model, nhead, dropout, rotary)
         self.norm2 = nn.LayerNorm(d_model)
         self.mlp = nn.Sequential(
             nn.Linear(d_model, d_ff),
@@ -91,11 +152,12 @@ class MusicTransformer(nn.Module):
         self.max_seq_len = max_seq_len
 
         self.token_embedding = nn.Embedding(vocab_size, d_model)
-        self.position_embedding = nn.Embedding(max_seq_len, d_model)
         self.embedding_dropout = nn.Dropout(dropout)
 
+        rotary = RotaryEmbedding(d_model // nhead, max_seq_len)
         self.blocks = nn.ModuleList(
-            TransformerBlock(d_model, nhead, d_ff, dropout) for _ in range(num_layers)
+            TransformerBlock(d_model, nhead, d_ff, dropout, rotary)
+            for _ in range(num_layers)
         )
         self.norm_final = nn.LayerNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
@@ -119,9 +181,7 @@ class MusicTransformer(nn.Module):
             f"seq_len={seq_len} exceeds max_seq_len={self.max_seq_len}"
         )
 
-        positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
-        x = self.token_embedding(input_ids) + self.position_embedding(positions)
-        x = self.embedding_dropout(x)
+        x = self.embedding_dropout(self.token_embedding(input_ids))
         assert x.shape == (batch_size, seq_len, self.d_model), f"Got {x.shape}"
 
         for block in self.blocks:
@@ -144,7 +204,7 @@ class MusicTransformer(nn.Module):
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    device = get_device()
 
     vocab_size = 500
     seq_len = 2048
