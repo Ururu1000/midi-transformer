@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import logging
+import random
 from pathlib import Path
-from typing import TypedDict
 
 import pretty_midi
 import torch
 from miditok import REMI, TokSequence, TokenizerConfig
+from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
-
 
 MAX_SEQ_LEN = 2048
 RAW_MIDI_DIR = Path("data/raw_midi")
@@ -16,34 +16,71 @@ PROCESSED_DIR = Path("data/processed")
 TOKENIZER_PATH = PROCESSED_DIR / "tokenizer.json"
 TOKENS_PATH = PROCESSED_DIR / "tokens.pt"
 
+PITCH_RANGE = (21, 109)
+NUM_VELOCITIES = 32
+# 4 positions per beat -> a 4/4 bar is quantized into 16 (1/16) positions.
+POSITIONS_PER_BEAT = 4
+
+# Pitch-shift augmentation range (semitones), applied on the fly per sample.
+MIN_PITCH_SHIFT = -6
+MAX_PITCH_SHIFT = 5
+
 logger = logging.getLogger(__name__)
 
 
-class MusicSample(TypedDict):
-    input_ids: torch.Tensor
-    attention_mask: torch.Tensor
+def build_pitch_shift_maps(
+    tokenizer: REMI,
+    vocab_size: int,
+    min_shift: int = MIN_PITCH_SHIFT,
+    max_shift: int = MAX_PITCH_SHIFT,
+) -> dict[int, Tensor]:
+    pitch_token_ids = {
+        int(token.split("_")[1]): token_id
+        for token, token_id in tokenizer.vocab.items()
+        if token.startswith("Pitch_")
+    }
+    assert pitch_token_ids, "No Pitch_* tokens found in tokenizer vocabulary"
+
+    lowest, highest = min(pitch_token_ids), max(pitch_token_ids)
+    shift_maps: dict[int, Tensor] = {}
+    for shift in range(min_shift, max_shift + 1):
+        # Identity mapping; only Pitch ids are redirected to the transposed pitch.
+        mapping = torch.arange(vocab_size, dtype=torch.long)
+        for pitch, token_id in pitch_token_ids.items():
+            # Clamp so transposition never leaves the tokenizer's pitch range.
+            shifted = min(max(pitch + shift, lowest), highest)
+            mapping[token_id] = pitch_token_ids[shifted]
+        shift_maps[shift] = mapping
+    return shift_maps
 
 
-class MusicDataset(Dataset[MusicSample]):
-    def __init__(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> None:
+class MusicDataset(Dataset[Tensor]):
+    def __init__(
+        self,
+        input_ids: Tensor,
+        pitch_shift_maps: dict[int, Tensor] | None = None,
+        min_shift: int = MIN_PITCH_SHIFT,
+        max_shift: int = MAX_PITCH_SHIFT,
+    ) -> None:
         assert input_ids.ndim == 2, f"Got {input_ids.shape}"
-        assert attention_mask.ndim == 2, f"Got {attention_mask.shape}"
-        assert input_ids.shape == attention_mask.shape, (
-            f"Got input_ids={input_ids.shape}, attention_mask={attention_mask.shape}"
-        )
-        assert input_ids.shape[1] == MAX_SEQ_LEN, f"Got {input_ids.shape}"
 
         self.input_ids = input_ids.long()
-        self.attention_mask = attention_mask.long()
+        self.seq_len = input_ids.shape[1]
+        self.pitch_shift_maps = pitch_shift_maps
+        self.min_shift = min_shift
+        self.max_shift = max_shift
 
     def __len__(self) -> int:
         return self.input_ids.shape[0]
 
-    def __getitem__(self, index: int) -> MusicSample:
-        return {
-            "input_ids": self.input_ids[index],
-            "attention_mask": self.attention_mask[index],
-        }
+    def __getitem__(self, index: int) -> Tensor:
+        sequence = self.input_ids[index]
+        if self.pitch_shift_maps is not None:
+            shift = random.randint(self.min_shift, self.max_shift)
+            sequence = self.pitch_shift_maps[shift][sequence]
+
+        assert sequence.shape == (self.seq_len,), f"Got {sequence.shape}"
+        return sequence
 
 
 def find_midi_files(raw_midi_dir: Path) -> list[Path]:
@@ -56,8 +93,13 @@ def find_midi_files(raw_midi_dir: Path) -> list[Path]:
 
 def build_tokenizer() -> REMI:
     config = TokenizerConfig(
+        pitch_range=PITCH_RANGE,
+        beat_res={(0, 4): POSITIONS_PER_BEAT, (4, 12): POSITIONS_PER_BEAT},
+        num_velocities=NUM_VELOCITIES,
         use_tempos=True,
         use_velocities=True,
+        use_chords=False,
+        use_rests=False,
     )
     return REMI(config)
 
@@ -177,7 +219,12 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
 
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     midi_files = find_midi_files(RAW_MIDI_DIR)
@@ -195,27 +242,15 @@ def main() -> None:
         tokenizer,
         MAX_SEQ_LEN,
     )
-    dataset = MusicDataset(input_ids, attention_mask)
+
+    pitch_shift_maps = build_pitch_shift_maps(tokenizer, len(tokenizer))
+    dataset = MusicDataset(input_ids, pitch_shift_maps)
     batch_size = min(4, len(dataset))
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-    first_batch = next(iter(dataloader))
+    first_batch = next(iter(dataloader)).to(device)
 
     expected_batch_shape = (batch_size, MAX_SEQ_LEN)
-    assert first_batch["input_ids"].shape == expected_batch_shape, (
-        f"Got {first_batch['input_ids'].shape}"
-    )
-    assert first_batch["attention_mask"].shape == expected_batch_shape, (
-        f"Got {first_batch['attention_mask'].shape}"
-    )
-
-    first_batch_input_ids = first_batch["input_ids"].to(device)
-    first_batch_attention_mask = first_batch["attention_mask"].to(device)
-    assert first_batch_input_ids.shape == expected_batch_shape, (
-        f"Got {first_batch_input_ids.shape}"
-    )
-    assert first_batch_attention_mask.shape == expected_batch_shape, (
-        f"Got {first_batch_attention_mask.shape}"
-    )
+    assert first_batch.shape == expected_batch_shape, f"Got {first_batch.shape}"
 
     save_tokenized_tensors(input_ids, attention_mask, tokenizer, TOKENS_PATH)
     logger.info(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
 from pathlib import Path
 
 import torch
@@ -8,17 +9,50 @@ import torch.nn.functional as F
 from miditok import REMI, TokSequence
 from torch import Tensor
 
-from model import MusicTransformer
+from model import MusicTransformer, get_device
 
-CHECKPOINT_PATH = Path("checkpoints/model_epoch_12.pt")
+CHECKPOINT_PATH = Path("checkpoints/model_epoch_20.pt")
 TOKENIZER_PATH = Path("data/processed/tokenizer.json")
 OUTPUT_PATH = Path("data/processed/output.mid")
 
-GENERATION_LENGTH = 512
-TEMPERATURE = 1.0
-TOP_K = 65
+GENERATION_LENGTH = 1024
+TEMPERATURE = 1.08
+TOP_K = 60
+TOP_P = 0.95
+REPETITION_PENALTY = 1.24
+REPETITION_WINDOW = 80
+STUCK_LOOKBACK = 16
+STUCK_UNIQUE_PITCH_THRESHOLD = 3
+TEMPERATURE_BOOST = 0.2
 
 logger = logging.getLogger(__name__)
+
+
+class TokenCategories:
+    """Vocabulary partitioned by REMI token role to guide sampling."""
+
+    def __init__(self, tokenizer: REMI, device: torch.device) -> None:
+        pitch: list[int] = []
+        structural: list[int] = []
+        forbidden: list[int] = []
+        for token, token_id in tokenizer.vocab.items():
+            prefix = token.split("_")[0]
+            if prefix in ("Pitch", "PitchDrum"):
+                pitch.append(token_id)
+            elif prefix in ("Bar", "Position"):
+                structural.append(token_id)
+            elif prefix in ("PAD", "BOS", "EOS", "MASK"):
+                forbidden.append(token_id)
+
+        vocab_size = len(tokenizer)
+        self.pitch_ids = torch.tensor(pitch, dtype=torch.long, device=device)
+        self.structural_ids = torch.tensor(structural, dtype=torch.long, device=device)
+        self.forbidden_ids = torch.tensor(forbidden, dtype=torch.long, device=device)
+
+        self.is_pitch = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+        self.is_pitch[self.pitch_ids] = True
+        self.is_structural = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+        self.is_structural[self.structural_ids] = True
 
 
 def load_model(checkpoint_path: Path, device: torch.device) -> MusicTransformer:
@@ -47,23 +81,54 @@ def pick_start_token(tokenizer: REMI) -> int:
     return start_token
 
 
-def sample_next_token(
+def apply_repetition_penalty(
     logits: Tensor,
-    temperature: float,
-    top_k: int,
-    forbidden_token_ids: Tensor,
-) -> int:
-    assert logits.ndim == 1, f"Got {logits.shape}"
+    window: deque[int],
+    categories: TokenCategories,
+    penalty: float,
+) -> None:
+    """Penalize pitch tokens seen in the lookback window; leave structure intact."""
+    if penalty <= 1.0 or not window:
+        return
 
-    logits = logits.clone()
-    logits[forbidden_token_ids] = float("-inf")
-    logits = logits / temperature
+    recent_ids = torch.tensor(list(set(window)), dtype=torch.long, device=logits.device)
+    recent_pitch_ids = recent_ids[categories.is_pitch[recent_ids]]
+    if recent_pitch_ids.numel() == 0:
+        return
 
-    top_k = min(top_k, logits.shape[-1])
-    top_values, top_indices = torch.topk(logits, top_k)
-    probs = F.softmax(top_values, dim=-1)
-    sampled = torch.multinomial(probs, num_samples=1)
-    return int(top_indices[sampled].item())
+    scores = logits[recent_pitch_ids]
+    logits[recent_pitch_ids] = torch.where(
+        scores > 0, scores / penalty, scores * penalty
+    )
+
+
+def top_k_top_p_filter(logits: Tensor, top_k: int, top_p: float) -> Tensor:
+    """Sequentially apply top-k then nucleus (top-p) filtering."""
+    filtered = logits.clone()
+
+    if top_k > 0:
+        top_k = min(top_k, filtered.shape[-1])
+        kth_value = torch.topk(filtered, top_k).values[-1]
+        filtered[filtered < kth_value] = float("-inf")
+
+    if 0.0 < top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(filtered, descending=True)
+        cumulative_probs = F.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+        remove_sorted = cumulative_probs > top_p
+        remove_sorted[1:] = remove_sorted[:-1].clone()
+        remove_sorted[0] = False
+        remove_indices = sorted_indices[remove_sorted]
+        filtered[remove_indices] = float("-inf")
+
+    return filtered
+
+
+def is_stuck(window: deque[int], categories: TokenCategories) -> bool:
+    """Detect a monotonic loop: too few distinct pitches in the recent lookback."""
+    recent_pitches = [t for t in window if categories.is_pitch[t]]
+    if len(recent_pitches) < STUCK_LOOKBACK // 2:
+        return False
+    return len(set(recent_pitches)) <= STUCK_UNIQUE_PITCH_THRESHOLD
 
 
 @torch.no_grad()
@@ -74,28 +139,48 @@ def generate(
     length: int,
     temperature: float,
     top_k: int,
+    top_p: float = TOP_P,
+    repetition_penalty: float = REPETITION_PENALTY,
+    repetition_window: int = REPETITION_WINDOW,
 ) -> list[int]:
+    categories = TokenCategories(tokenizer, device)
     start_token = pick_start_token(tokenizer)
     generated = [start_token]
 
-    forbidden = [
-        tokenizer[token]
-        for token in ("PAD_None", "BOS_None", "EOS_None", "MASK_None")
-        if token in tokenizer.vocab
-    ]
-    forbidden_token_ids = torch.tensor(forbidden, dtype=torch.long, device=device)
+    penalty_window: deque[int] = deque([start_token], maxlen=repetition_window)
+    stuck_window: deque[int] = deque([start_token], maxlen=STUCK_LOOKBACK)
 
     log_every = max(length // 10, 1)
     for step in range(1, length):
         context = torch.tensor([generated], dtype=torch.long, device=device)
         context = context[:, -model.max_seq_len :]
 
-        logits = model(context)
-        next_logits = logits[0, -1, :]
-        next_token = sample_next_token(
-            next_logits, temperature, top_k, forbidden_token_ids
+        logits = model(context)[0, -1, :].float()
+        assert logits.ndim == 1, f"Got {logits.shape}"
+
+        logits[categories.forbidden_ids] = float("-inf")
+        apply_repetition_penalty(
+            logits, penalty_window, categories, repetition_penalty
         )
+
+        # Dynamic temperature: break out of note loops by forcing exploration.
+        effective_temperature = temperature
+        if is_stuck(stuck_window, categories):
+            effective_temperature += TEMPERATURE_BOOST
+        logits = logits / effective_temperature
+
+        # Guardrail: never let filtering erase the structural tokens entirely.
+        structural_scores = logits[categories.structural_ids].clone()
+        filtered = top_k_top_p_filter(logits, top_k, top_p)
+        if torch.isinf(filtered).all():
+            filtered[categories.structural_ids] = structural_scores
+
+        probs = F.softmax(filtered, dim=-1)
+        next_token = int(torch.multinomial(probs, num_samples=1).item())
+
         generated.append(next_token)
+        penalty_window.append(next_token)
+        stuck_window.append(next_token)
 
         if step % log_every == 0 or step == length - 1:
             logger.info("Generating token %d/%d (id=%d)", step + 1, length, next_token)
@@ -122,13 +207,20 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    device = get_device()
     logger.info("Device: %s", device)
 
     tokenizer = REMI(params=str(TOKENIZER_PATH))
     logger.info("Loaded tokenizer from %s | vocab_size=%d", TOKENIZER_PATH, len(tokenizer))
 
     model = load_model(CHECKPOINT_PATH, device)
+    if model.vocab_size != len(tokenizer):
+        logger.warning(
+            "Checkpoint vocab_size=%d != tokenizer vocab_size=%d; using the "
+            "checkpoint value to stay consistent with the trained weights",
+            model.vocab_size,
+            len(tokenizer),
+        )
 
     token_ids = generate(
         model,
