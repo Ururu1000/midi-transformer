@@ -54,17 +54,22 @@ def build_pitch_shift_maps(
     return shift_maps
 
 
-class MusicDataset(Dataset[Tensor]):
+class MusicDataset(Dataset[tuple[Tensor, Tensor]]):
     def __init__(
         self,
         input_ids: Tensor,
+        attention_mask: Tensor,
         pitch_shift_maps: dict[int, Tensor] | None = None,
         min_shift: int = MIN_PITCH_SHIFT,
         max_shift: int = MAX_PITCH_SHIFT,
     ) -> None:
         assert input_ids.ndim == 2, f"Got {input_ids.shape}"
+        assert attention_mask.shape == input_ids.shape, (
+            f"Got input_ids={input_ids.shape}, attention_mask={attention_mask.shape}"
+        )
 
         self.input_ids = input_ids.long()
+        self.attention_mask = attention_mask.long()
         self.seq_len = input_ids.shape[1]
         self.pitch_shift_maps = pitch_shift_maps
         self.min_shift = min_shift
@@ -73,14 +78,16 @@ class MusicDataset(Dataset[Tensor]):
     def __len__(self) -> int:
         return self.input_ids.shape[0]
 
-    def __getitem__(self, index: int) -> Tensor:
+    def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:
         sequence = self.input_ids[index]
+        mask = self.attention_mask[index]
         if self.pitch_shift_maps is not None:
             shift = random.randint(self.min_shift, self.max_shift)
             sequence = self.pitch_shift_maps[shift][sequence]
 
         assert sequence.shape == (self.seq_len,), f"Got {sequence.shape}"
-        return sequence
+        assert mask.shape == (self.seq_len,), f"Got {mask.shape}"
+        return sequence, mask
 
 
 def find_midi_files(raw_midi_dir: Path) -> list[Path]:
@@ -244,13 +251,16 @@ def main() -> None:
     )
 
     pitch_shift_maps = build_pitch_shift_maps(tokenizer, len(tokenizer))
-    dataset = MusicDataset(input_ids, pitch_shift_maps)
+    dataset = MusicDataset(input_ids, attention_mask, pitch_shift_maps)
     batch_size = min(4, len(dataset))
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-    first_batch = next(iter(dataloader)).to(device)
+    first_ids, first_mask = next(iter(dataloader))
+    first_ids = first_ids.to(device)
+    first_mask = first_mask.to(device)
 
     expected_batch_shape = (batch_size, MAX_SEQ_LEN)
-    assert first_batch.shape == expected_batch_shape, f"Got {first_batch.shape}"
+    assert first_ids.shape == expected_batch_shape, f"Got {first_ids.shape}"
+    assert first_mask.shape == expected_batch_shape, f"Got {first_mask.shape}"
 
     save_tokenized_tensors(input_ids, attention_mask, tokenizer, TOKENS_PATH)
     logger.info(
