@@ -8,6 +8,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+import wandb
 from miditok import REMI
 from torch import nn
 from torch.utils.data import DataLoader
@@ -32,6 +33,7 @@ NUM_EPOCHS = 5
 WARMUP_EPOCHS = 1
 LEARNING_RATE = 3e-4
 WEIGHT_DECAY = 0.01
+MAX_GRAD_NORM = 1.0
 LOG_EVERY = 10
 SEED = 42
 
@@ -45,6 +47,13 @@ RESUME_TRAINING = False
 # Sequences are tokenized at 2048. Attention memory scales ~O(L^2); set this
 # (e.g. 1024) to truncate long sequences and cut VRAM. None keeps full length.
 MAX_SEQ_LEN: int | None = None
+
+USE_WANDB = True
+WANDB_PROJECT = "ai-music-project"
+WANDB_ENTITY: str | None = None
+WANDB_RUN_NAME: str | None = None
+# "online" | "offline" | "disabled" — offline is useful on air-gapped VMs.
+WANDB_MODE = "online"
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +146,7 @@ def save_checkpoint(
     scaler: torch.amp.GradScaler,
     vocab_size: int,
     pad_token_id: int,
+    wandb_run_id: str | None = None,
 ) -> None:
     payload = {
         "epoch": epoch,
@@ -148,6 +158,7 @@ def save_checkpoint(
         "seed": SEED,
         "vocab_size": vocab_size,
         "pad_token_id": pad_token_id,
+        "wandb_run_id": wandb_run_id,
     }
     # Atomic write avoids truncated checkpoints if the VM dies mid-save.
     temp_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp")
@@ -162,16 +173,17 @@ def resume_from_checkpoint(
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     scaler: torch.amp.GradScaler,
     device: torch.device,
-) -> int:
+) -> tuple[int, str | None]:
     if checkpoint_path is None or not checkpoint_path.exists():
         logger.warning("No checkpoint found, training from scratch")
-        return 0
+        return 0, None
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
     load_model_state_dict(model, checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
     completed_epochs = int(checkpoint["epoch"])
+    wandb_run_id = checkpoint.get("wandb_run_id")
 
     if "scheduler_state_dict" in checkpoint:
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
@@ -200,7 +212,58 @@ def resume_from_checkpoint(
         completed_epochs,
         scheduler.get_last_lr()[0],
     )
-    return completed_epochs
+    return completed_epochs, wandb_run_id
+
+
+def init_wandb(
+    *,
+    device: torch.device,
+    batch_size: int,
+    vocab_size: int,
+    num_params_m: float,
+    dataset_size: int,
+    resume_run_id: str | None,
+) -> Any:
+    if not USE_WANDB or WANDB_MODE == "disabled":
+        logger.info("wandb logging disabled")
+        return None
+
+    init_kwargs: dict[str, Any] = {
+        "project": WANDB_PROJECT,
+        "entity": WANDB_ENTITY,
+        "name": WANDB_RUN_NAME,
+        "mode": WANDB_MODE,
+        "config": {
+            "batch_size": batch_size,
+            "local_batch_size": LOCAL_BATCH_SIZE,
+            "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
+            "effective_batch_size": batch_size * GRADIENT_ACCUMULATION_STEPS,
+            "num_epochs": NUM_EPOCHS,
+            "warmup_epochs": WARMUP_EPOCHS,
+            "learning_rate": LEARNING_RATE,
+            "weight_decay": WEIGHT_DECAY,
+            "max_grad_norm": MAX_GRAD_NORM,
+            "seed": SEED,
+            "num_workers": NUM_WORKERS,
+            "max_seq_len": MAX_SEQ_LEN,
+            "resume_training": RESUME_TRAINING,
+            "device": str(device),
+            "vocab_size": vocab_size,
+            "num_params_m": num_params_m,
+            "dataset_size": dataset_size,
+            "d_model": 768,
+            "nhead": 12,
+            "num_layers": 16,
+            "d_ff": 3072,
+        },
+    }
+    if resume_run_id is not None:
+        init_kwargs["id"] = resume_run_id
+        init_kwargs["resume"] = "allow"
+
+    run = wandb.init(**init_kwargs)
+    logger.info("wandb run: %s (%s)", run.name, run.id)
+    return run
 
 
 def train_one_epoch(
@@ -213,7 +276,9 @@ def train_one_epoch(
     epoch: int,
     amp_dtype: torch.dtype,
     use_amp: bool,
-) -> float:
+    global_step: int,
+    use_wandb: bool,
+) -> tuple[float, int]:
     model.train()
     total_loss = 0.0
     num_batches = len(dataloader)
@@ -251,22 +316,42 @@ def train_one_epoch(
         # Step on every Nth batch, and always flush on the final batch so the
         # last (possibly partial) accumulation window is not dropped.
         is_accumulation_boundary = (step + 1) % GRADIENT_ACCUMULATION_STEPS == 0
+        grad_norm: float | None = None
         if is_accumulation_boundary or (step + 1) == num_batches:
+            scaler.unscale_(optimizer)
+            grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_norm=MAX_GRAD_NORM,
+                ).item()
+            )
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-        total_loss += loss.item()
+        batch_loss = loss.item()
+        total_loss += batch_loss
+        global_step += 1
+
         if (step + 1) % LOG_EVERY == 0:
             logger.info(
                 "Epoch %d | Batch %d/%d | Loss %.4f",
                 epoch,
                 step + 1,
                 num_batches,
-                loss.item(),
+                batch_loss,
             )
+            if use_wandb:
+                metrics = {
+                    "train/batch_loss": batch_loss,
+                    "train/epoch": epoch,
+                    "train/batch": step + 1,
+                }
+                if grad_norm is not None:
+                    metrics["train/grad_norm"] = grad_norm
+                wandb.log(metrics, step=global_step)
 
-    return total_loss / max(num_batches, 1)
+    return total_loss / max(num_batches, 1), global_step
 
 
 def main() -> None:
@@ -318,7 +403,8 @@ def main() -> None:
     # Build optimizer/scheduler on the raw module, resume, then compile so
     # checkpoint keys stay portable and parameter identity is preserved.
     model: nn.Module = MusicTransformer(vocab_size=vocab_size).to(device)
-    logger.info("Model parameters: %.2fM", unwrap_model(model).get_num_params())
+    num_params_m = unwrap_model(model).get_num_params()
+    logger.info("Model parameters: %.2fM", num_params_m)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -343,9 +429,10 @@ def main() -> None:
     )
 
     completed_epochs = 0
+    wandb_run_id: str | None = None
     if RESUME_TRAINING:
         latest_checkpoint = find_latest_checkpoint(CHECKPOINTS_DIR)
-        completed_epochs = resume_from_checkpoint(
+        completed_epochs, wandb_run_id = resume_from_checkpoint(
             latest_checkpoint,
             model,
             optimizer,
@@ -358,50 +445,80 @@ def main() -> None:
             "RESUME_TRAINING is disabled, training from randomly initialized weights"
         )
 
+    wandb_run = init_wandb(
+        device=device,
+        batch_size=batch_size,
+        vocab_size=vocab_size,
+        num_params_m=num_params_m,
+        dataset_size=len(dataset),
+        resume_run_id=wandb_run_id if RESUME_TRAINING else None,
+    )
+    use_wandb = wandb_run is not None
+    if use_wandb:
+        wandb_run_id = wandb_run.id
+
     if device.type == "cuda":
         logger.info("Compiling model with torch.compile")
         model = torch.compile(model)
 
     start_epoch = completed_epochs + 1
+    global_step = completed_epochs * len(dataloader)
 
-    for epoch in range(start_epoch, NUM_EPOCHS + 1):
-        avg_loss = train_one_epoch(
-            model,
-            dataloader,
-            optimizer,
-            scaler,
-            device,
-            pad_token_id,
-            epoch,
-            amp_dtype,
-            use_amp,
-        )
-        scheduler.step()
+    try:
+        for epoch in range(start_epoch, NUM_EPOCHS + 1):
+            avg_loss, global_step = train_one_epoch(
+                model,
+                dataloader,
+                optimizer,
+                scaler,
+                device,
+                pad_token_id,
+                epoch,
+                amp_dtype,
+                use_amp,
+                global_step,
+                use_wandb,
+            )
+            scheduler.step()
+            current_lr = scheduler.get_last_lr()[0]
 
-        logger.info(
-            "Epoch %d finished | Avg loss %.4f | LR %.2e",
-            epoch,
-            avg_loss,
-            scheduler.get_last_lr()[0],
-        )
+            logger.info(
+                "Epoch %d finished | Avg loss %.4f | LR %.2e",
+                epoch,
+                avg_loss,
+                current_lr,
+            )
+            if use_wandb:
+                wandb.log(
+                    {
+                        "train/epoch_loss": avg_loss,
+                        "train/lr": current_lr,
+                        "train/epoch": epoch,
+                    },
+                    step=global_step,
+                )
 
-        checkpoint_path = CHECKPOINTS_DIR / f"model_epoch_{epoch}.pt"
-        save_checkpoint(
-            checkpoint_path,
-            epoch=epoch,
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            scaler=scaler,
-            vocab_size=vocab_size,
-            pad_token_id=pad_token_id,
-        )
-        logger.info("Saved checkpoint to %s", checkpoint_path)
+            checkpoint_path = CHECKPOINTS_DIR / f"model_epoch_{epoch}.pt"
+            save_checkpoint(
+                checkpoint_path,
+                epoch=epoch,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                vocab_size=vocab_size,
+                pad_token_id=pad_token_id,
+                wandb_run_id=wandb_run_id,
+            )
+            logger.info("Saved checkpoint to %s", checkpoint_path)
 
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-        elif device.type == "mps":
-            torch.mps.empty_cache()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            elif device.type == "mps":
+                torch.mps.empty_cache()
+    finally:
+        if use_wandb:
+            wandb.finish()
 
 
 if __name__ == "__main__":

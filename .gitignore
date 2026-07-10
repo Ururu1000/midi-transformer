@@ -5,3 +5,4 @@ data/processed/
 *.pt
 *.pth
 /ai v4(new model).zip
+wandb/

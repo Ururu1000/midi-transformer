@@ -11,6 +11,7 @@ from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 
 MAX_SEQ_LEN = 2048
+CHUNK_STRIDE = 1024
 RAW_MIDI_DIR = Path("data/raw_midi")
 PROCESSED_DIR = Path("data/processed")
 TOKENIZER_PATH = PROCESSED_DIR / "tokenizer.json"
@@ -144,10 +145,14 @@ def chunk_ids(
     ids: list[int],
     max_seq_len: int,
     pad_token_id: int,
+    stride: int,
 ) -> list[tuple[list[int], list[int]]]:
+    assert 0 < stride <= max_seq_len, (
+        f"stride={stride} must be in range [1, {max_seq_len}]"
+    )
     chunks: list[tuple[list[int], list[int]]] = []
 
-    for start in range(0, len(ids), max_seq_len):
+    for start in range(0, len(ids), stride):
         chunk = ids[start : start + max_seq_len]
         if len(chunk) == 0:
             continue
@@ -169,6 +174,7 @@ def tokenize_midi_files(
     midi_files: list[Path],
     tokenizer: REMI,
     max_seq_len: int,
+    chunk_stride: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     all_input_ids: list[list[int]] = []
     all_attention_masks: list[list[int]] = []
@@ -184,6 +190,7 @@ def tokenize_midi_files(
                 ids,
                 max_seq_len,
                 tokenizer.pad_token_id,
+                chunk_stride,
             ):
                 all_input_ids.append(chunk)
                 all_attention_masks.append(attention_mask)
@@ -213,6 +220,7 @@ def save_tokenized_tensors(
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "max_seq_len": MAX_SEQ_LEN,
+            "chunk_stride": CHUNK_STRIDE,
             "pad_token_id": tokenizer.pad_token_id,
             "vocab_size": len(tokenizer),
         },
@@ -248,6 +256,7 @@ def main() -> None:
         midi_files,
         tokenizer,
         MAX_SEQ_LEN,
+        CHUNK_STRIDE,
     )
 
     pitch_shift_maps = build_pitch_shift_maps(tokenizer, len(tokenizer))
