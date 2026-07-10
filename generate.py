@@ -59,7 +59,13 @@ def load_model(checkpoint_path: Path, device: torch.device) -> MusicTransformer:
     checkpoint = torch.load(checkpoint_path, map_location=device)
     vocab_size = int(checkpoint["vocab_size"])
     model = MusicTransformer(vocab_size=vocab_size).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    state_dict = checkpoint["model_state_dict"]
+    # Checkpoints saved under torch.compile may prefix keys with `_orig_mod.`.
+    cleaned = {
+        (key[len("_orig_mod.") :] if key.startswith("_orig_mod.") else key): value
+        for key, value in state_dict.items()
+    }
+    model.load_state_dict(cleaned)
     model.eval()
     logger.info(
         "Loaded model from %s | vocab_size=%d | %.2fM params",
