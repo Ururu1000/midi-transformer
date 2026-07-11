@@ -5,14 +5,11 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
-import torch
-from miditok import REMI
-
 from generate import generate, load_model, tokens_to_midi_file
 from model import get_device
 from scripts.tokenize_midi import ComposerREMI
 
-CHECKPOINT_PATH = Path("checkpoints/model_epoch_20.pt")
+CHECKPOINT_PATH = Path("checkpoints/model_best.pt")
 TOKENIZER_PATH = Path("data/processed/tokenizer.json")
 OUTPUT_DIR = Path("data/generated")
 
@@ -26,6 +23,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Preset:
     name: str
+    composer: str
     temperature: float
     top_k: int
     top_p: float
@@ -36,49 +34,54 @@ class Preset:
 
 PRESETS: list[Preset] = [
     Preset(
-        name="01",
-        temperature=1.08,
+        name="01_liszt",
+        composer="Sergei Rachmaninoff",
+        temperature=1.02,
         top_k=60,
         top_p=0.95,
-        repetition_penalty=1.24,
-        length=512,
-        description="Low temp, tight nucleus, strong anti-repeat → clean melody",
+        repetition_penalty=1.15,
+        length=1024,
+        description="Liszt: virtuosic, high exploration",
     ),
     Preset(
-        name="02",
-        temperature=1.08,
+        name="02_debussy",
+        composer="Sergei Rachmaninoff",
+        temperature=1.02,
         top_k=60,
         top_p=0.95,
-        repetition_penalty=1.24,
-        length=512,
-        description="Balanced sampling with nucleus filtering, natural phrasing",
+        repetition_penalty=1.15,
+        length=1024,
+        description="Debussy: soft colors, medium free sampling",
     ),
     Preset(
-        name="03",
-        temperature=1.08,
-        top_k=60,   
-        top_p=0.95,
-        repetition_penalty=1.24,
-        length=512,
-        description="Above 1.0, wider nucleus → more dynamic variation",
-    ),
-    Preset(
-        name="04",
-        temperature=1.08,
+        name="03_schubert",
+        composer="Sergei Rachmaninoff",
+        temperature=1.02,
         top_k=60,
         top_p=0.95,
-        repetition_penalty=1.24,
-        length=512,
-        description="Balanced but 2x longer with firmer anti-repeat for structure",
+        repetition_penalty=1.15,
+        length=1024,
+        description="Schubert: lyrical, tighter anti-repeat",
     ),
     Preset(
-        name="05",
-        temperature=1.08,
+        name="04_scarlatti",
+        composer="Sergei Rachmaninoff",
+        temperature=1.02,   
         top_k=60,
         top_p=0.95,
-        repetition_penalty=1.24,
-        length=512,
-        description="High temp, wide nucleus → chaotic and experimental",
+        repetition_penalty=1.15,
+        length=1024,
+        description="Scarlatti: crisp, focused baroque keyboard",
+    ),
+    Preset(
+        name="05_scriabin",
+        composer="Sergei Rachmaninoff",
+        temperature=1.02,
+        top_k=60,
+        top_p=0.95,
+        repetition_penalty=1.15,
+        length=1024,
+        description="Scriabin: dense harmony, wide nucleus",
     ),
 ]
 
@@ -93,12 +96,12 @@ def main() -> None:
 
     for preset in PRESETS:
         logger.info(
-            "--- Preset: %s | temp=%.2f top_k=%d top_p=%.2f rep_pen=%.2f length=%d ---",
+            "--- Preset: %s | composer=%s temp=%.2f top_k=%d top_p=%.2f length=%d ---",
             preset.name,
+            preset.composer,
             preset.temperature,
             preset.top_k,
             preset.top_p,
-            preset.repetition_penalty,
             preset.length,
         )
         logger.info("    %s", preset.description)
@@ -110,6 +113,7 @@ def main() -> None:
             length=preset.length,
             temperature=preset.temperature,
             top_k=preset.top_k,
+            composer=preset.composer,
             top_p=preset.top_p,
             repetition_penalty=preset.repetition_penalty,
         )
@@ -118,8 +122,8 @@ def main() -> None:
         tokens_to_midi_file(tokenizer, token_ids, out_path)
 
     logger.info("Done. Files saved to %s/", OUTPUT_DIR)
-    for p in sorted(OUTPUT_DIR.glob("*.mid")):
-        logger.info("  %s  (%d bytes)", p.name, p.stat().st_size)
+    for path in sorted(OUTPUT_DIR.glob("*.mid")):
+        logger.info("  %s  (%d bytes)", path.name, path.stat().st_size)
 
 
 if __name__ == "__main__":
