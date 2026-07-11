@@ -1,24 +1,32 @@
 from __future__ import annotations
 
+import json
 import logging
 import random
+from dataclasses import dataclass
 from pathlib import Path
 
+import pandas as pd
 import pretty_midi
 import torch
 from miditok import REMI, TokSequence, TokenizerConfig
 from torch import Tensor
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 
 MAX_SEQ_LEN = 2048
 CHUNK_STRIDE = 1024
-RAW_MIDI_DIR = Path("data/raw_midi")
+DATASET_DIR = Path("data/raw_midi")
+METADATA_PATH = DATASET_DIR / "maestro-v3.0.0.csv"
 PROCESSED_DIR = Path("data/processed")
 TOKENIZER_PATH = PROCESSED_DIR / "tokenizer.json"
-TOKENS_PATH = PROCESSED_DIR / "tokens.pt"
+COMPOSER_MAPPING_PATH = PROCESSED_DIR / "composer_mapping.json"
+TRAIN_TOKENS_PATH = PROCESSED_DIR / "tokens_train.pt"
+VAL_TOKENS_PATH = PROCESSED_DIR / "tokens_val.pt"
 
 PITCH_RANGE = (21, 109)
 NUM_VELOCITIES = 32
+TOP_COMPOSERS = 15
+OTHER_COMPOSER = "OTHER"
 # 4 positions per beat -> a 4/4 bar is quantized into 16 (1/16) positions.
 POSITIONS_PER_BEAT = 4
 
@@ -27,6 +35,62 @@ MIN_PITCH_SHIFT = -6
 MAX_PITCH_SHIFT = 5
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class MidiRecord:
+    midi_path: Path
+    composer: str
+    split: str
+
+
+def composer_prompt(composer: str) -> str:
+    return f"[COMPOSER: {composer}]"
+
+
+def composer_vocab_token(composer: str) -> str:
+    return f"{composer_prompt(composer)}_None"
+
+
+def load_metadata(metadata_path: Path, dataset_dir: Path) -> pd.DataFrame:
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"MAESTRO metadata not found: {metadata_path}")
+
+    metadata = pd.read_csv(metadata_path)
+    required_columns = {"midi_filename", "canonical_composer", "split"}
+    missing_columns = required_columns.difference(metadata.columns)
+    if missing_columns:
+        missing = ", ".join(sorted(missing_columns))
+        raise ValueError(f"Metadata missing required columns: {missing}")
+
+    metadata = metadata.loc[:, sorted(required_columns)].dropna().copy()
+    metadata["midi_path"] = metadata["midi_filename"].map(
+        lambda filename: dataset_dir / str(filename)
+    )
+    return metadata
+
+
+def build_composer_mapping(metadata: pd.DataFrame) -> dict[str, str]:
+    counts = metadata["canonical_composer"].astype(str).value_counts()
+    top_composers = set(counts.head(TOP_COMPOSERS).index)
+    return {
+        composer: composer if composer in top_composers else OTHER_COMPOSER
+        for composer in counts.index
+    }
+
+
+def save_composer_mapping(mapping: dict[str, str], output_path: Path) -> None:
+    payload = {
+        "top_composers": [
+            composer for composer, group in mapping.items() if group != OTHER_COMPOSER
+        ],
+        "other_token": composer_vocab_token(OTHER_COMPOSER),
+        "composer_to_group": mapping,
+    }
+    output_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def build_pitch_shift_maps(
@@ -70,7 +134,7 @@ class MusicDataset(Dataset[tuple[Tensor, Tensor]]):
         )
 
         self.input_ids = input_ids.long()
-        self.attention_mask = attention_mask.long()
+        self.attention_mask = attention_mask.bool()
         self.seq_len = input_ids.shape[1]
         self.pitch_shift_maps = pitch_shift_maps
         self.min_shift = min_shift
@@ -91,19 +155,19 @@ class MusicDataset(Dataset[tuple[Tensor, Tensor]]):
         return sequence, mask
 
 
-def find_midi_files(raw_midi_dir: Path) -> list[Path]:
-    return sorted(
-        path
-        for path in raw_midi_dir.rglob("*")
-        if path.is_file() and path.suffix.lower() in {".mid", ".midi"}
-    )
-
-
-def build_tokenizer() -> REMI:
+def build_tokenizer(composer_groups: list[str] | None = None) -> REMI:
+    groups = composer_groups or []
     config = TokenizerConfig(
         pitch_range=PITCH_RANGE,
         beat_res={(0, 4): POSITIONS_PER_BEAT, (4, 12): POSITIONS_PER_BEAT},
         num_velocities=NUM_VELOCITIES,
+        special_tokens=[
+            "PAD",
+            "BOS",
+            "EOS",
+            "MASK",
+            *(composer_prompt(composer) for composer in groups),
+        ],
         use_tempos=True,
         use_velocities=True,
         use_chords=False,
@@ -146,17 +210,20 @@ def chunk_ids(
     max_seq_len: int,
     pad_token_id: int,
     stride: int,
+    prefix_token_id: int,
 ) -> list[tuple[list[int], list[int]]]:
-    assert 0 < stride <= max_seq_len, (
-        f"stride={stride} must be in range [1, {max_seq_len}]"
+    content_length = max_seq_len - 1
+    assert 0 < stride <= content_length, (
+        f"stride={stride} must be in range [1, {content_length}]"
     )
     chunks: list[tuple[list[int], list[int]]] = []
 
     for start in range(0, len(ids), stride):
-        chunk = ids[start : start + max_seq_len]
-        if len(chunk) == 0:
+        content = ids[start : start + content_length]
+        if len(content) == 0:
             continue
 
+        chunk = [prefix_token_id, *content]
         attention_mask = [1] * len(chunk)
         pad_length = max_seq_len - len(chunk)
         if pad_length > 0:
@@ -170,20 +237,42 @@ def chunk_ids(
     return chunks
 
 
-def tokenize_midi_files(
-    midi_files: list[Path],
+def tokenize_split(
+    metadata: pd.DataFrame,
+    split: str,
     tokenizer: REMI,
+    composer_mapping: dict[str, str],
     max_seq_len: int,
     chunk_stride: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     all_input_ids: list[list[int]] = []
     all_attention_masks: list[list[int]] = []
+    split_rows = metadata[metadata["split"].astype(str).str.lower() == split]
+    processed_files = 0
+    missing_files = 0
 
-    for midi_path in midi_files:
+    for row in split_rows.itertuples(index=False):
+        record = MidiRecord(
+            midi_path=Path(row.midi_path),
+            composer=str(row.canonical_composer),
+            split=str(row.split),
+        )
+        midi_path = record.midi_path
+        if not midi_path.exists():
+            logger.warning("Skipping missing MIDI file: %s", midi_path)
+            missing_files += 1
+            continue
         if not validate_midi_file(midi_path):
             continue
 
-        tokens = tokenizer(midi_path)
+        composer_group = composer_mapping.get(record.composer, OTHER_COMPOSER)
+        prefix_token_id = tokenizer[composer_vocab_token(composer_group)]
+        try:
+            tokens = tokenizer(midi_path)
+        except Exception as exc:
+            logger.warning("Skipping MIDI file %s: tokenization failed: %s", midi_path, exc)
+            continue
+
         for sequence in as_token_sequences(tokens):
             ids = sequence_ids(tokenizer, sequence)
             for chunk, attention_mask in chunk_ids(
@@ -191,21 +280,30 @@ def tokenize_midi_files(
                 max_seq_len,
                 tokenizer.pad_token_id,
                 chunk_stride,
+                prefix_token_id,
             ):
                 all_input_ids.append(chunk)
                 all_attention_masks.append(attention_mask)
+        processed_files += 1
 
     if len(all_input_ids) == 0:
-        msg = f"No token sequences were created from {len(midi_files)} MIDI files."
+        msg = f"No token sequences were created for split '{split}'."
         raise ValueError(msg)
 
     input_ids = torch.tensor(all_input_ids, dtype=torch.long)
-    attention_mask = torch.tensor(all_attention_masks, dtype=torch.long)
+    attention_mask = torch.tensor(all_attention_masks, dtype=torch.bool)
 
     expected_shape = (len(all_input_ids), max_seq_len)
     assert input_ids.shape == expected_shape, f"Got {input_ids.shape}"
     assert attention_mask.shape == expected_shape, f"Got {attention_mask.shape}"
 
+    logger.info(
+        "Processed split=%s | files=%d | missing=%d | chunks=%d",
+        split,
+        processed_files,
+        missing_files,
+        len(all_input_ids),
+    )
     return input_ids, attention_mask
 
 
@@ -219,8 +317,6 @@ def save_tokenized_tensors(
         {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "max_seq_len": MAX_SEQ_LEN,
-            "chunk_stride": CHUNK_STRIDE,
             "pad_token_id": tokenizer.pad_token_id,
             "vocab_size": len(tokenizer),
         },
@@ -234,48 +330,62 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-    midi_files = find_midi_files(RAW_MIDI_DIR)
-    if len(midi_files) == 0:
-        msg = f"No .mid or .midi files found in {RAW_MIDI_DIR}."
-        raise FileNotFoundError(msg)
+    metadata = load_metadata(METADATA_PATH, DATASET_DIR)
+    composer_mapping = build_composer_mapping(metadata)
+    composer_groups = [
+        composer
+        for composer, group in composer_mapping.items()
+        if group != OTHER_COMPOSER
+    ]
+    composer_groups.append(OTHER_COMPOSER)
 
-    logger.info("Found %d MIDI files in %s", len(midi_files), RAW_MIDI_DIR)
+    logger.info(
+        "Loaded %d metadata rows | composers=%d | conditioned groups=%d",
+        len(metadata),
+        len(composer_mapping),
+        len(composer_groups),
+    )
 
-    tokenizer = build_tokenizer()
+    tokenizer = build_tokenizer(composer_groups)
     tokenizer.save(TOKENIZER_PATH)
+    save_composer_mapping(composer_mapping, COMPOSER_MAPPING_PATH)
 
-    input_ids, attention_mask = tokenize_midi_files(
-        midi_files,
+    train_input_ids, train_attention_mask = tokenize_split(
+        metadata,
+        "train",
         tokenizer,
+        composer_mapping,
+        MAX_SEQ_LEN,
+        CHUNK_STRIDE,
+    )
+    val_input_ids, val_attention_mask = tokenize_split(
+        metadata,
+        "validation",
+        tokenizer,
+        composer_mapping,
         MAX_SEQ_LEN,
         CHUNK_STRIDE,
     )
 
-    pitch_shift_maps = build_pitch_shift_maps(tokenizer, len(tokenizer))
-    dataset = MusicDataset(input_ids, attention_mask, pitch_shift_maps)
-    batch_size = min(4, len(dataset))
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-    first_ids, first_mask = next(iter(dataloader))
-    first_ids = first_ids.to(device)
-    first_mask = first_mask.to(device)
-
-    expected_batch_shape = (batch_size, MAX_SEQ_LEN)
-    assert first_ids.shape == expected_batch_shape, f"Got {first_ids.shape}"
-    assert first_mask.shape == expected_batch_shape, f"Got {first_mask.shape}"
-
-    save_tokenized_tensors(input_ids, attention_mask, tokenizer, TOKENS_PATH)
+    save_tokenized_tensors(
+        train_input_ids,
+        train_attention_mask,
+        tokenizer,
+        TRAIN_TOKENS_PATH,
+    )
+    save_tokenized_tensors(
+        val_input_ids,
+        val_attention_mask,
+        tokenizer,
+        VAL_TOKENS_PATH,
+    )
     logger.info(
-        "Saved %d sequences to %s and tokenizer params to %s",
-        len(dataset),
-        TOKENS_PATH,
+        "Saved train=%d to %s | validation=%d to %s | tokenizer=%s",
+        len(train_input_ids),
+        TRAIN_TOKENS_PATH,
+        len(val_input_ids),
+        VAL_TOKENS_PATH,
         TOKENIZER_PATH,
     )
 
