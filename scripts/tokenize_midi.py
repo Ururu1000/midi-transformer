@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -44,12 +46,28 @@ class MidiRecord:
     split: str
 
 
-def composer_prompt(composer: str) -> str:
-    return f"[COMPOSER: {composer}]"
+def sanitize_composer_name(composer: str) -> str:
+    normalized = unicodedata.normalize("NFKD", composer)
+    without_accents = "".join(
+        character
+        for character in normalized
+        if not unicodedata.combining(character)
+    )
+    sanitized = re.sub(r"[^A-Za-z0-9]+", "_", without_accents).strip("_")
+    if not sanitized:
+        raise ValueError(f"Composer name cannot be sanitized: {composer!r}")
+    return sanitized
 
 
 def composer_vocab_token(composer: str) -> str:
-    return f"{composer_prompt(composer)}_None"
+    return f"Composer_{sanitize_composer_name(composer)}"
+
+
+class ComposerREMI(REMI):
+    def _create_base_vocabulary(self) -> list[str]:
+        vocabulary = super()._create_base_vocabulary()
+        composer_tokens = self.config.additional_params.get("composer_tokens", [])
+        return [*composer_tokens, *vocabulary]
 
 
 def load_metadata(metadata_path: Path, dataset_dir: Path) -> pd.DataFrame:
@@ -119,7 +137,7 @@ def build_pitch_shift_maps(
     return shift_maps
 
 
-class MusicDataset(Dataset[tuple[Tensor, Tensor]]):
+class MusicDataset(Dataset[tuple[Tensor, Tensor, Tensor]]):
     def __init__(
         self,
         input_ids: Tensor,
@@ -143,7 +161,7 @@ class MusicDataset(Dataset[tuple[Tensor, Tensor]]):
     def __len__(self) -> int:
         return self.input_ids.shape[0]
 
-    def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:
+    def __getitem__(self, index: int) -> tuple[Tensor, Tensor, Tensor]:
         sequence = self.input_ids[index]
         mask = self.attention_mask[index]
         if self.pitch_shift_maps is not None:
@@ -152,28 +170,34 @@ class MusicDataset(Dataset[tuple[Tensor, Tensor]]):
 
         assert sequence.shape == (self.seq_len,), f"Got {sequence.shape}"
         assert mask.shape == (self.seq_len,), f"Got {mask.shape}"
-        return sequence, mask
+        inputs = sequence[:-1]
+        targets = sequence[1:]
+        input_mask = mask[:-1]
+        expected_shape = (self.seq_len - 1,)
+        assert inputs.shape == expected_shape, f"Got {inputs.shape}"
+        assert targets.shape == expected_shape, f"Got {targets.shape}"
+        assert input_mask.shape == expected_shape, f"Got {input_mask.shape}"
+        return inputs, targets, input_mask
 
 
-def build_tokenizer(composer_groups: list[str] | None = None) -> REMI:
+def build_tokenizer(composer_groups: list[str] | None = None) -> ComposerREMI:
     groups = composer_groups or []
+    composer_tokens = [composer_vocab_token(composer) for composer in groups]
+    if len(composer_tokens) != len(set(composer_tokens)):
+        raise ValueError("Composer names collide after sanitization")
+
     config = TokenizerConfig(
         pitch_range=PITCH_RANGE,
         beat_res={(0, 4): POSITIONS_PER_BEAT, (4, 12): POSITIONS_PER_BEAT},
         num_velocities=NUM_VELOCITIES,
-        special_tokens=[
-            "PAD",
-            "BOS",
-            "EOS",
-            "MASK",
-            *(composer_prompt(composer) for composer in groups),
-        ],
+        special_tokens=["PAD", "BOS", "EOS", "MASK"],
+        composer_tokens=composer_tokens,
         use_tempos=True,
         use_velocities=True,
         use_chords=False,
         use_rests=False,
     )
-    return REMI(config)
+    return ComposerREMI(config)
 
 
 def validate_midi_file(midi_path: Path) -> bool:

@@ -10,6 +10,7 @@ from miditok import REMI, TokSequence
 from torch import Tensor
 
 from model import MusicTransformer, get_device
+from scripts.tokenize_midi import ComposerREMI
 
 CHECKPOINT_PATH = Path("checkpoints/model_epoch_20.pt")
 TOKENIZER_PATH = Path("data/processed/tokenizer.json")
@@ -216,7 +217,7 @@ def main() -> None:
     device = get_device()
     logger.info("Device: %s", device)
 
-    tokenizer = REMI(params=str(TOKENIZER_PATH))
+    tokenizer = ComposerREMI(params=str(TOKENIZER_PATH))
     logger.info("Loaded tokenizer from %s | vocab_size=%d", TOKENIZER_PATH, len(tokenizer))
 
     model = load_model(CHECKPOINT_PATH, device)
