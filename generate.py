@@ -10,17 +10,18 @@ from miditok import REMI, TokSequence
 from torch import Tensor
 
 from model import MusicTransformer, get_device
-from scripts.tokenize_midi import ComposerREMI
+from scripts.tokenize_midi import ComposerREMI, composer_vocab_token
 
-CHECKPOINT_PATH = Path("checkpoints/model_epoch_20.pt")
+CHECKPOINT_PATH = Path("checkpoints/model_best.pt")
 TOKENIZER_PATH = Path("data/processed/tokenizer.json")
 OUTPUT_PATH = Path("data/processed/output.mid")
 
+COMPOSER = "Frédéric Chopin"
 GENERATION_LENGTH = 1024
-TEMPERATURE = 1.08
+TEMPERATURE = 1.0
 TOP_K = 60
 TOP_P = 0.95
-REPETITION_PENALTY = 1.24
+REPETITION_PENALTY = 1.15
 REPETITION_WINDOW = 80
 STUCK_LOOKBACK = 16
 STUCK_UNIQUE_PITCH_THRESHOLD = 3
@@ -42,7 +43,7 @@ class TokenCategories:
                 pitch.append(token_id)
             elif prefix in ("Bar", "Position"):
                 structural.append(token_id)
-            elif prefix in ("PAD", "BOS", "EOS", "MASK"):
+            elif prefix in ("PAD", "BOS", "EOS", "MASK", "Composer"):
                 forbidden.append(token_id)
 
         vocab_size = len(tokenizer)
@@ -77,14 +78,25 @@ def load_model(checkpoint_path: Path, device: torch.device) -> MusicTransformer:
     return model
 
 
-def pick_start_token(tokenizer: REMI) -> int:
-    if "BOS_None" in tokenizer.vocab:
-        start_token = tokenizer["BOS_None"]
-        logger.info("Using BOS token as seed (id=%d)", start_token)
-        return start_token
+def list_composer_tokens(tokenizer: REMI) -> list[str]:
+    return sorted(token for token in tokenizer.vocab if token.startswith("Composer_"))
 
-    start_token = int(torch.randint(0, len(tokenizer), (1,)).item())
-    logger.info("No BOS token, using random seed token (id=%d)", start_token)
+
+def resolve_composer_token(tokenizer: REMI, composer: str) -> str:
+    token = composer_vocab_token(composer)
+    if token in tokenizer.vocab:
+        return token
+
+    available = list_composer_tokens(tokenizer)
+    raise KeyError(
+        f"Composer token {token!r} missing from tokenizer. Available: {available}"
+    )
+
+
+def pick_start_token(tokenizer: REMI, composer: str) -> int:
+    token = resolve_composer_token(tokenizer, composer)
+    start_token = tokenizer[token]
+    logger.info("Using composer seed %s (id=%d)", token, start_token)
     return start_token
 
 
@@ -146,12 +158,13 @@ def generate(
     length: int,
     temperature: float,
     top_k: int,
+    composer: str = COMPOSER,
     top_p: float = TOP_P,
     repetition_penalty: float = REPETITION_PENALTY,
     repetition_window: int = REPETITION_WINDOW,
 ) -> list[int]:
     categories = TokenCategories(tokenizer, device)
-    start_token = pick_start_token(tokenizer)
+    start_token = pick_start_token(tokenizer, composer)
     generated = [start_token]
 
     penalty_window: deque[int] = deque([start_token], maxlen=repetition_window)
@@ -202,7 +215,12 @@ def tokens_to_midi_file(
     output_path: Path,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    sequence = TokSequence(ids=token_ids)
+    # Composer_* tokens are conditioning-only and break MidiTok Type_Value decode.
+    composer_ids = {
+        tokenizer[token] for token in list_composer_tokens(tokenizer)
+    }
+    decode_ids = [token_id for token_id in token_ids if token_id not in composer_ids]
+    sequence = TokSequence(ids=decode_ids)
     score = tokenizer.tokens_to_midi([sequence])
     score.dump_midi(output_path)
     logger.info("Saved generated MIDI to %s", output_path)
@@ -236,6 +254,7 @@ def main() -> None:
         GENERATION_LENGTH,
         TEMPERATURE,
         TOP_K,
+        composer=COMPOSER,
     )
     logger.info("Generated %d tokens", len(token_ids))
 
