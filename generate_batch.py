@@ -10,6 +10,7 @@ from miditok import REMI
 
 from generate import generate, load_model, tokens_to_midi_file
 from model import get_device
+from scripts.tokenize_midi import ComposerREMI
 
 CHECKPOINT_PATH = Path("checkpoints/model_epoch_20.pt")
 TOKENIZER_PATH = Path("data/processed/tokenizer.json")
@@ -87,7 +88,7 @@ def main() -> None:
     device = get_device()
     logger.info("Device: %s", device)
 
-    tokenizer = REMI(params=str(TOKENIZER_PATH))
+    tokenizer = ComposerREMI(params=str(TOKENIZER_PATH))
     model = load_model(CHECKPOINT_PATH, device)
 
     for preset in PRESETS:

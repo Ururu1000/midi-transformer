@@ -9,14 +9,18 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 import wandb
-from miditok import REMI
 from torch import nn
 from torch.utils.data import DataLoader
 
 from model import MusicTransformer, get_device
-from scripts.tokenize_midi import MusicDataset, build_pitch_shift_maps
+from scripts.tokenize_midi import (
+    ComposerREMI,
+    MusicDataset,
+    build_pitch_shift_maps,
+)
 
-TOKENS_PATH = Path("data/processed/tokens_train.pt")
+TRAIN_TOKENS_PATH = Path("data/processed/tokens_train.pt")
+VAL_TOKENS_PATH = Path("data/processed/tokens_val.pt")
 TOKENIZER_PATH = Path("data/processed/tokenizer.json")
 CHECKPOINTS_DIR = Path("checkpoints")
 CHECKPOINT_PATTERN = re.compile(r"model_epoch_(\d+)\.pt$")
@@ -101,25 +105,50 @@ def restore_rng_state(rng_state: dict[str, Any]) -> None:
         torch.cuda.set_rng_state_all(rng_state["cuda"])
 
 
-def load_training_data(
-    tokens_path: Path,
+def load_datasets(
+    train_tokens_path: Path,
+    val_tokens_path: Path,
     tokenizer_path: Path,
-) -> tuple[MusicDataset, int, int]:
-    checkpoint = torch.load(tokens_path)
-    input_ids = checkpoint["input_ids"]
-    attention_mask = checkpoint["attention_mask"]
-    assert input_ids.ndim == 2, f"Got {input_ids.shape}"
-    assert attention_mask.shape == input_ids.shape, (
-        f"Got input_ids={input_ids.shape}, attention_mask={attention_mask.shape}"
+) -> tuple[MusicDataset, MusicDataset, int, int]:
+    if not train_tokens_path.exists():
+        raise FileNotFoundError(f"Training tokens not found: {train_tokens_path}")
+    if not val_tokens_path.exists():
+        raise FileNotFoundError(f"Validation tokens not found: {val_tokens_path}")
+
+    train_checkpoint = torch.load(train_tokens_path, map_location="cpu")
+    val_checkpoint = torch.load(val_tokens_path, map_location="cpu")
+
+    train_ids = train_checkpoint["input_ids"].long()
+    train_mask = train_checkpoint["attention_mask"].bool()
+    val_ids = val_checkpoint["input_ids"].long()
+    val_mask = val_checkpoint["attention_mask"].bool()
+
+    assert train_ids.ndim == 2, f"Got train input_ids={train_ids.shape}"
+    assert val_ids.ndim == 2, f"Got val input_ids={val_ids.shape}"
+    assert train_mask.shape == train_ids.shape, (
+        f"Got train input_ids={train_ids.shape}, attention_mask={train_mask.shape}"
+    )
+    assert val_mask.shape == val_ids.shape, (
+        f"Got val input_ids={val_ids.shape}, attention_mask={val_mask.shape}"
     )
 
-    vocab_size = int(checkpoint["vocab_size"])
-    pad_token_id = int(checkpoint["pad_token_id"])
+    vocab_size = int(train_checkpoint["vocab_size"])
+    pad_token_id = int(train_checkpoint["pad_token_id"])
+    if int(val_checkpoint["vocab_size"]) != vocab_size:
+        raise ValueError("Train and validation vocab_size values do not match")
+    if int(val_checkpoint["pad_token_id"]) != pad_token_id:
+        raise ValueError("Train and validation pad_token_id values do not match")
 
-    tokenizer = REMI(params=str(tokenizer_path))
+    tokenizer = ComposerREMI(params=str(tokenizer_path))
+    if len(tokenizer) != vocab_size:
+        raise ValueError(
+            f"Tokenizer vocab_size={len(tokenizer)} != data vocab_size={vocab_size}"
+        )
+
     pitch_shift_maps = build_pitch_shift_maps(tokenizer, vocab_size)
-    dataset = MusicDataset(input_ids.long(), attention_mask.long(), pitch_shift_maps)
-    return dataset, vocab_size, pad_token_id
+    train_dataset = MusicDataset(train_ids, train_mask, pitch_shift_maps)
+    val_dataset = MusicDataset(val_ids, val_mask)
+    return train_dataset, val_dataset, vocab_size, pad_token_id
 
 
 def find_latest_checkpoint(checkpoints_dir: Path) -> Path | None:
@@ -146,6 +175,7 @@ def save_checkpoint(
     scaler: torch.amp.GradScaler,
     vocab_size: int,
     pad_token_id: int,
+    best_val_loss: float,
     wandb_run_id: str | None = None,
 ) -> None:
     payload = {
@@ -158,6 +188,7 @@ def save_checkpoint(
         "seed": SEED,
         "vocab_size": vocab_size,
         "pad_token_id": pad_token_id,
+        "best_val_loss": best_val_loss,
         "wandb_run_id": wandb_run_id,
     }
     # Atomic write avoids truncated checkpoints if the VM dies mid-save.
@@ -173,16 +204,17 @@ def resume_from_checkpoint(
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     scaler: torch.amp.GradScaler,
     device: torch.device,
-) -> tuple[int, str | None]:
+) -> tuple[int, float, str | None]:
     if checkpoint_path is None or not checkpoint_path.exists():
         logger.warning("No checkpoint found, training from scratch")
-        return 0, None
+        return 0, float("inf"), None
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
     load_model_state_dict(model, checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
     completed_epochs = int(checkpoint["epoch"])
+    best_val_loss = float(checkpoint.get("best_val_loss", float("inf")))
     wandb_run_id = checkpoint.get("wandb_run_id")
 
     if "scheduler_state_dict" in checkpoint:
@@ -212,7 +244,7 @@ def resume_from_checkpoint(
         completed_epochs,
         scheduler.get_last_lr()[0],
     )
-    return completed_epochs, wandb_run_id
+    return completed_epochs, best_val_loss, wandb_run_id
 
 
 def init_wandb(
@@ -221,7 +253,8 @@ def init_wandb(
     batch_size: int,
     vocab_size: int,
     num_params_m: float,
-    dataset_size: int,
+    train_dataset_size: int,
+    val_dataset_size: int,
     resume_run_id: str | None,
 ) -> Any:
     if not USE_WANDB or WANDB_MODE == "disabled":
@@ -250,7 +283,8 @@ def init_wandb(
             "device": str(device),
             "vocab_size": vocab_size,
             "num_params_m": num_params_m,
-            "dataset_size": dataset_size,
+            "train_dataset_size": train_dataset_size,
+            "val_dataset_size": val_dataset_size,
             "d_model": 768,
             "nhead": 12,
             "num_layers": 16,
@@ -285,25 +319,25 @@ def train_one_epoch(
     vocab_size = unwrap_model(model).vocab_size
 
     optimizer.zero_grad(set_to_none=True)
-    for step, (batch, attention_mask) in enumerate(dataloader):
-        batch = batch.to(device, non_blocking=True)
-        attention_mask = attention_mask.to(device, non_blocking=True)
+    for step, (inputs, targets, mask) in enumerate(dataloader):
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        mask = mask.to(device, non_blocking=True)
         if MAX_SEQ_LEN is not None:
-            batch = batch[:, :MAX_SEQ_LEN]
-            attention_mask = attention_mask[:, :MAX_SEQ_LEN]
+            context_length = max(MAX_SEQ_LEN - 1, 1)
+            inputs = inputs[:, :context_length]
+            targets = targets[:, :context_length]
+            mask = mask[:, :context_length]
 
-        inputs = batch[:, :-1]
-        targets = batch[:, 1:]
-        input_mask = attention_mask[:, :-1]
         assert inputs.shape == targets.shape, (
             f"Got inputs={inputs.shape}, targets={targets.shape}"
         )
-        assert input_mask.shape == inputs.shape, (
-            f"Got input_mask={input_mask.shape}, inputs={inputs.shape}"
+        assert mask.shape == inputs.shape, (
+            f"Got mask={mask.shape}, inputs={inputs.shape}"
         )
 
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-            logits = model(inputs, attention_mask=input_mask)
+            logits = model(inputs, attention_mask=mask)
             loss = F.cross_entropy(
                 logits.reshape(-1, vocab_size),
                 targets.reshape(-1),
@@ -354,6 +388,59 @@ def train_one_epoch(
     return total_loss / max(num_batches, 1), global_step
 
 
+def validate(
+    model: nn.Module,
+    val_loader: DataLoader,
+    device: torch.device,
+    pad_token_id: int,
+    amp_dtype: torch.dtype,
+    use_amp: bool,
+) -> float:
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
+    vocab_size = unwrap_model(model).vocab_size
+
+    with torch.no_grad():
+        for inputs, targets, mask in val_loader:
+            inputs = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
+            if MAX_SEQ_LEN is not None:
+                context_length = max(MAX_SEQ_LEN - 1, 1)
+                inputs = inputs[:, :context_length]
+                targets = targets[:, :context_length]
+                mask = mask[:, :context_length]
+
+            assert inputs.shape == targets.shape, (
+                f"Got inputs={inputs.shape}, targets={targets.shape}"
+            )
+            assert mask.shape == inputs.shape, (
+                f"Got mask={mask.shape}, inputs={inputs.shape}"
+            )
+
+            with torch.autocast(
+                device_type=device.type,
+                dtype=amp_dtype,
+                enabled=use_amp,
+            ):
+                logits = model(inputs, attention_mask=mask)
+                loss = F.cross_entropy(
+                    logits.reshape(-1, vocab_size),
+                    targets.reshape(-1),
+                    ignore_index=pad_token_id,
+                    reduction="sum",
+                )
+
+            valid_tokens = int(targets.ne(pad_token_id).sum().item())
+            total_loss += float(loss.item())
+            total_tokens += valid_tokens
+
+    if total_tokens == 0:
+        raise ValueError("Validation set contains no non-padding target tokens")
+    return total_loss / total_tokens
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -384,18 +471,30 @@ def main() -> None:
     )
 
     CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
-    dataset, vocab_size, pad_token_id = load_training_data(TOKENS_PATH, TOKENIZER_PATH)
+    train_dataset, val_dataset, vocab_size, pad_token_id = load_datasets(
+        TRAIN_TOKENS_PATH,
+        VAL_TOKENS_PATH,
+        TOKENIZER_PATH,
+    )
     logger.info(
-        "Loaded %d sequences | vocab_size=%d | pad_token_id=%d",
-        len(dataset),
+        "Loaded train=%d | validation=%d | vocab_size=%d | pad_token_id=%d",
+        len(train_dataset),
+        len(val_dataset),
         vocab_size,
         pad_token_id,
     )
 
-    dataloader = DataLoader(
-        dataset,
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=batch_size,
         shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=device.type == "cuda",
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
         num_workers=NUM_WORKERS,
         pin_memory=device.type == "cuda",
     )
@@ -429,10 +528,11 @@ def main() -> None:
     )
 
     completed_epochs = 0
+    best_val_loss = float("inf")
     wandb_run_id: str | None = None
     if RESUME_TRAINING:
         latest_checkpoint = find_latest_checkpoint(CHECKPOINTS_DIR)
-        completed_epochs, wandb_run_id = resume_from_checkpoint(
+        completed_epochs, best_val_loss, wandb_run_id = resume_from_checkpoint(
             latest_checkpoint,
             model,
             optimizer,
@@ -450,7 +550,8 @@ def main() -> None:
         batch_size=batch_size,
         vocab_size=vocab_size,
         num_params_m=num_params_m,
-        dataset_size=len(dataset),
+        train_dataset_size=len(train_dataset),
+        val_dataset_size=len(val_dataset),
         resume_run_id=wandb_run_id if RESUME_TRAINING else None,
     )
     use_wandb = wandb_run is not None
@@ -462,13 +563,13 @@ def main() -> None:
         model = torch.compile(model)
 
     start_epoch = completed_epochs + 1
-    global_step = completed_epochs * len(dataloader)
+    global_step = completed_epochs * len(train_loader)
 
     try:
         for epoch in range(start_epoch, NUM_EPOCHS + 1):
             avg_loss, global_step = train_one_epoch(
                 model,
-                dataloader,
+                train_loader,
                 optimizer,
                 scaler,
                 device,
@@ -479,19 +580,29 @@ def main() -> None:
                 global_step,
                 use_wandb,
             )
+            val_loss = validate(
+                model,
+                val_loader,
+                device,
+                pad_token_id,
+                amp_dtype,
+                use_amp,
+            )
             scheduler.step()
             current_lr = scheduler.get_last_lr()[0]
 
             logger.info(
-                "Epoch %d finished | Avg loss %.4f | LR %.2e",
+                "Epoch %d finished | Train loss %.4f | Val loss %.4f | LR %.2e",
                 epoch,
                 avg_loss,
+                val_loss,
                 current_lr,
             )
             if use_wandb:
                 wandb.log(
                     {
-                        "train/epoch_loss": avg_loss,
+                        "train_loss": avg_loss,
+                        "val_loss": val_loss,
                         "train/lr": current_lr,
                         "train/epoch": epoch,
                     },
@@ -508,9 +619,31 @@ def main() -> None:
                 scaler=scaler,
                 vocab_size=vocab_size,
                 pad_token_id=pad_token_id,
+                best_val_loss=min(best_val_loss, val_loss),
                 wandb_run_id=wandb_run_id,
             )
             logger.info("Saved checkpoint to %s", checkpoint_path)
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_checkpoint_path = CHECKPOINTS_DIR / "model_best.pt"
+                save_checkpoint(
+                    best_checkpoint_path,
+                    epoch=epoch,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    vocab_size=vocab_size,
+                    pad_token_id=pad_token_id,
+                    best_val_loss=best_val_loss,
+                    wandb_run_id=wandb_run_id,
+                )
+                logger.info(
+                    "Saved new best checkpoint to %s | Val loss %.4f",
+                    best_checkpoint_path,
+                    best_val_loss,
+                )
 
             if device.type == "cuda":
                 torch.cuda.empty_cache()
