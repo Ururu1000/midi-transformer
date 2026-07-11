@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from model import MusicTransformer, get_device
 from scripts.tokenize_midi import MusicDataset, build_pitch_shift_maps
 
-TOKENS_PATH = Path("data/processed/tokens.pt")
+TOKENS_PATH = Path("data/processed/tokens_train.pt")
 TOKENIZER_PATH = Path("data/processed/tokenizer.json")
 CHECKPOINTS_DIR = Path("checkpoints")
 CHECKPOINT_PATTERN = re.compile(r"model_epoch_(\d+)\.pt$")
