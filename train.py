@@ -46,7 +46,7 @@ NUM_WORKERS = 4
 
 # The RoPE/REMI architecture is incompatible with old absolute-PE checkpoints,
 # so training starts from scratch by default.
-RESUME_TRAINING = False
+RESUME_TRAINING = True
 
 # Sequences are tokenized at 2048. Attention memory scales ~O(L^2); set this
 # (e.g. 1024) to truncate long sequences and cut VRAM. None keeps full length.
@@ -389,7 +389,7 @@ def train_one_epoch(
 
 
 def validate(
-    model: nn.Module,
+    model: nn.Module, 
     val_loader: DataLoader,
     device: torch.device,
     pad_token_id: int,
