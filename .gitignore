@@ -6,3 +6,4 @@ data/processed/
 *.pth
 /ai v4(new model).zip
 wandb/
+.gitignore
