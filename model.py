@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -23,8 +24,6 @@ def rotate_half(x: Tensor) -> Tensor:
 
 
 class RotaryEmbedding(nn.Module):
-    # Relative position encoding via rotation of Q/K, shared across all layers.
-    # Music depends on relative distances between notes, hence RoPE over absolute PE.
     def __init__(
         self, head_dim: int, max_seq_len: int, base: float = 10000.0
     ) -> None:
@@ -41,8 +40,9 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("cos_cached", emb.cos(), persistent=False)
         self.register_buffer("sin_cached", emb.sin(), persistent=False)
 
-    def forward(self, seq_len: int) -> tuple[Tensor, Tensor]:
-        return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
+    def forward(self, seq_len: int, start_pos: int = 0) -> tuple[Tensor, Tensor]:
+        end_pos = start_pos + seq_len
+        return self.cos_cached[start_pos:end_pos], self.sin_cached[start_pos:end_pos]
 
 
 def apply_rotary(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
@@ -52,33 +52,34 @@ def apply_rotary(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return x * cos + rotate_half(x) * sin
 
 
-def build_causal_padding_attn_mask(
-    attention_mask: Tensor,
-    dtype: torch.dtype,
-) -> Tensor:
-    """Convert (batch, seq) 1/0 mask into additive SDPA mask (batch, 1, seq, seq).
+class RMSNorm(nn.Module):
+    def __init__(self, d_model: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d_model))
 
-    Combines a lower-triangular causal mask with key padding: pad positions
-    cannot be attended to. Used with is_causal=False because this PyTorch
-    build rejects explicit attn_mask together with is_causal=True.
-    """
-    assert attention_mask.ndim == 2, f"Got {attention_mask.shape}"
-    batch_size, seq_len = attention_mask.shape
-    device = attention_mask.device
+    def forward(self, x: Tensor) -> Tensor:
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps)
+        return self.weight * x
 
-    causal = torch.ones(seq_len, seq_len, device=device, dtype=torch.bool).tril()
-    key_valid = attention_mask.bool()[:, None, :]
-    allowed = causal[None, :, :] & key_valid
 
-    attn_mask = torch.zeros(
-        batch_size,
-        1,
-        seq_len,
-        seq_len,
-        device=device,
-        dtype=dtype,
-    )
-    return attn_mask.masked_fill(~allowed[:, None, :, :], torch.finfo(dtype).min)
+class SwiGLU(nn.Module):
+    def __init__(self, d_model: int, d_ff: int, dropout: float) -> None:
+        super().__init__()
+        hidden_dim = int(d_ff * 2 / 3)
+        self.w1 = nn.Linear(d_model, hidden_dim, bias=False)
+        self.w2 = nn.Linear(d_model, hidden_dim, bias=False)
+        self.w3 = nn.Linear(hidden_dim, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.dropout(self.w3(F.silu(self.w1(x)) * self.w2(x)))
+
+
+class KVCache(NamedTuple):
+    key: Tensor
+    value: Tensor
 
 
 class CausalSelfAttention(nn.Module):
@@ -102,21 +103,43 @@ class CausalSelfAttention(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model)
         self.resid_dropout = nn.Dropout(dropout)
 
-    def forward(self, x: Tensor, attn_mask: Tensor | None = None) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        past_key_value: KVCache | None = None,
+        start_pos: int = 0,
+        use_cache: bool = False,
+    ) -> tuple[Tensor, KVCache | None]:
         batch_size, seq_len, d_model = x.shape
         assert d_model == self.d_model, f"Got {x.shape}"
 
         qkv = self.qkv_proj(x)
-        assert qkv.shape == (batch_size, seq_len, 3 * self.d_model), f"Got {qkv.shape}"
-
         q, k, v = qkv.chunk(3, dim=-1)
         q = q.view(batch_size, seq_len, self.nhead, self.head_dim).transpose(1, 2)
         k = k.view(batch_size, seq_len, self.nhead, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, seq_len, self.nhead, self.head_dim).transpose(1, 2)
 
-        cos, sin = self.rotary(seq_len)
+        cos, sin = self.rotary(seq_len, start_pos=start_pos)
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
+
+        if past_key_value is not None:
+            k = torch.cat([past_key_value.key, k], dim=2)
+            v = torch.cat([past_key_value.value, v], dim=2)
+
+        next_cache = KVCache(key=k, value=v) if use_cache else None
+
+        query_len = q.shape[2]
+        key_len = k.shape[2]
+        # is_causal aligns the mask to the top-left corner, which is only correct
+        # when queries cover the whole key sequence. With a cache the queries are
+        # the tail of the keys, so the mask must be offset by the cached length.
+        attn_mask: Tensor | None = None
+        is_causal = query_len == key_len
+        if not is_causal:
+            attn_mask = torch.ones(
+                query_len, key_len, dtype=torch.bool, device=q.device
+            ).tril(diagonal=key_len - query_len)
 
         attn = F.scaled_dot_product_attention(
             q,
@@ -124,19 +147,11 @@ class CausalSelfAttention(nn.Module):
             v,
             attn_mask=attn_mask,
             dropout_p=self.dropout if self.training else 0.0,
-            is_causal=attn_mask is None,
+            is_causal=is_causal,
         )
-        assert attn.shape == (
-            batch_size,
-            self.nhead,
-            seq_len,
-            self.head_dim,
-        ), f"Got {attn.shape}"
-
         attn = attn.transpose(1, 2).reshape(batch_size, seq_len, self.d_model)
         out = self.resid_dropout(self.out_proj(attn))
-        assert out.shape == (batch_size, seq_len, self.d_model), f"Got {out.shape}"
-        return out
+        return out, next_cache
 
 
 class TransformerBlock(nn.Module):
@@ -149,20 +164,28 @@ class TransformerBlock(nn.Module):
         rotary: RotaryEmbedding,
     ) -> None:
         super().__init__()
-        self.norm1 = nn.LayerNorm(d_model)
+        self.norm1 = RMSNorm(d_model)
         self.attn = CausalSelfAttention(d_model, nhead, dropout, rotary)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, d_ff),
-            nn.GELU(),
-            nn.Linear(d_ff, d_model),
-            nn.Dropout(dropout),
-        )
+        self.norm2 = RMSNorm(d_model)
+        self.mlp = SwiGLU(d_model, d_ff, dropout)
 
-    def forward(self, x: Tensor, attn_mask: Tensor | None = None) -> Tensor:
-        x = x + self.attn(self.norm1(x), attn_mask=attn_mask)
+    def forward(
+        self,
+        x: Tensor,
+        past_key_value: KVCache | None = None,
+        start_pos: int = 0,
+        use_cache: bool = False,
+    ) -> tuple[Tensor, KVCache | None]:
+        normed = self.norm1(x)
+        attn_out, next_cache = self.attn(
+            normed,
+            past_key_value=past_key_value,
+            start_pos=start_pos,
+            use_cache=use_cache,
+        )
+        x = x + attn_out
         x = x + self.mlp(self.norm2(x))
-        return x
+        return x, next_cache
 
 
 class MusicTransformer(nn.Module):
@@ -180,6 +203,7 @@ class MusicTransformer(nn.Module):
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.max_seq_len = max_seq_len
+        self.num_layers = num_layers
 
         self.token_embedding = nn.Embedding(vocab_size, d_model)
         self.embedding_dropout = nn.Dropout(dropout)
@@ -189,7 +213,7 @@ class MusicTransformer(nn.Module):
             TransformerBlock(d_model, nhead, d_ff, dropout, rotary)
             for _ in range(num_layers)
         )
-        self.norm_final = nn.LayerNorm(d_model)
+        self.norm_final = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
         self.token_embedding.weight = self.lm_head.weight
@@ -208,27 +232,37 @@ class MusicTransformer(nn.Module):
     def forward(
         self,
         input_ids: Tensor,
-        attention_mask: Tensor | None = None,
-    ) -> Tensor:
+        past_key_values: list[KVCache | None] | None = None,
+        use_cache: bool = False,
+    ) -> tuple[Tensor, list[KVCache | None] | None]:
         batch_size, seq_len = input_ids.shape
-        assert seq_len <= self.max_seq_len, (
-            f"seq_len={seq_len} exceeds max_seq_len={self.max_seq_len}"
+        start_pos = 0
+        if past_key_values is not None:
+            assert len(past_key_values) == self.num_layers, (
+                f"Expected {self.num_layers} cached layers, got {len(past_key_values)}"
+            )
+            first_cache = past_key_values[0]
+            if first_cache is not None:
+                start_pos = first_cache.key.shape[2]
+
+        assert start_pos + seq_len <= self.max_seq_len, (
+            f"start_pos={start_pos} + seq_len={seq_len} exceeds max_seq_len={self.max_seq_len}"
         )
 
         x = self.embedding_dropout(self.token_embedding(input_ids))
         assert x.shape == (batch_size, seq_len, self.d_model), f"Got {x.shape}"
 
-        attn_mask: Tensor | None = None
-        if attention_mask is not None:
-            assert attention_mask.shape == (batch_size, seq_len), (
-                f"Got attention_mask={attention_mask.shape}, expected={(batch_size, seq_len)}"
+        next_caches: list[KVCache | None] = [] if use_cache else []
+        for layer_idx, block in enumerate(self.blocks):
+            layer_cache = past_key_values[layer_idx] if past_key_values is not None else None
+            x, cache = block(
+                x,
+                past_key_value=layer_cache,
+                start_pos=start_pos,
+                use_cache=use_cache,
             )
-            # Full-length batches keep the fast is_causal SDPA path.
-            if not bool(attention_mask.all()):
-                attn_mask = build_causal_padding_attn_mask(attention_mask, x.dtype)
-
-        for block in self.blocks:
-            x = block(x, attn_mask=attn_mask)
+            if use_cache:
+                next_caches.append(cache)
 
         x = self.norm_final(x)
         logits = self.lm_head(x)
@@ -237,7 +271,8 @@ class MusicTransformer(nn.Module):
             seq_len,
             self.vocab_size,
         ), f"Got {logits.shape}"
-        return logits
+
+        return logits, (next_caches if use_cache else None)
 
     def get_num_params(self) -> float:
         num_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -250,14 +285,14 @@ if __name__ == "__main__":
     device = get_device()
 
     vocab_size = 500
-    seq_len = 2048
+    seq_len = 128
     model = MusicTransformer(vocab_size=vocab_size).to(device)
 
     logger.info("Device: %s", device)
     logger.info("Trainable parameters: %.2fM", model.get_num_params())
 
     fake_input = torch.randint(0, vocab_size, (2, seq_len), device=device)
-    logits = model(fake_input)
+    logits, _ = model(fake_input)
 
     logger.info("Input shape: %s", tuple(fake_input.shape))
     logger.info("Output shape: %s", tuple(logits.shape))
