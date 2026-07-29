@@ -15,8 +15,8 @@ from miditok import REMI, TokSequence, TokenizerConfig
 from torch import Tensor
 from torch.utils.data import Dataset
 
-MAX_SEQ_LEN = 2048
-CHUNK_STRIDE = 1024
+MAX_SEQ_LEN = 4096
+CHUNK_STRIDE = 2048
 DATASET_DIR = Path("data/raw_midi")
 METADATA_PATH = DATASET_DIR / "maestro-v3.0.0.csv"
 PROCESSED_DIR = Path("data/processed")
@@ -29,8 +29,8 @@ PITCH_RANGE = (21, 109)
 NUM_VELOCITIES = 32
 TOP_COMPOSERS = 15
 OTHER_COMPOSER = "OTHER"
-# 4 positions per beat -> a 4/4 bar is quantized into 16 (1/16) positions.
-POSITIONS_PER_BEAT = 4
+# 12 positions per beat -> triplet / rubato-friendly 1/12 quantization.
+POSITIONS_PER_BEAT = 12
 
 # Pitch-shift augmentation range (semitones), applied on the fly per sample.
 MIN_PITCH_SHIFT = -6
@@ -194,8 +194,8 @@ def build_tokenizer(composer_groups: list[str] | None = None) -> ComposerREMI:
         composer_tokens=composer_tokens,
         use_tempos=True,
         use_velocities=True,
-        use_chords=False,
-        use_rests=False,
+        use_chords=True,
+        use_rests=True,
     )
     return ComposerREMI(config)
 

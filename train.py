@@ -9,13 +9,12 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 import wandb
-from torch import nn
+from torch import Tensor, nn
 from torch.utils.data import DataLoader
 
 from model import MusicTransformer, get_device
 from scripts.tokenize_midi import (
     ComposerREMI,
-    MusicDataset,
     build_pitch_shift_maps,
 )
 
@@ -25,11 +24,11 @@ TOKENIZER_PATH = Path("data/processed/tokenizer.json")
 CHECKPOINTS_DIR = Path("checkpoints")
 CHECKPOINT_PATTERN = re.compile(r"model_epoch_(\d+)\.pt$")
 
-# Tuned for an NVIDIA T4 (16GB VRAM): a 27M param model fits batch 128 at
+# Tuned for an NVIDIA L4 (16GB VRAM): a 113M param model fits batch 120 at
 # seq_len 2048, so no gradient accumulation is needed.
 BATCH_SIZE = 12
 # MPS/CPU have no flash-attention kernel, so SDPA materializes the full
-# (batch, heads, seq, seq) score matrix; batch 128 needs ~16GB there. This
+# (batch, heads, seq, seq) score matrix; batch 120 needs ~18GB there. This
 # smaller batch keeps local smoke tests on a MacBook within memory.
 LOCAL_BATCH_SIZE = 1
 GRADIENT_ACCUMULATION_STEPS = 10
@@ -44,13 +43,12 @@ SEED = 42
 # DataLoader workers for the Linux VM; pinned memory speeds up host->GPU copies.
 NUM_WORKERS = 4
 
-# The RoPE/REMI architecture is incompatible with old absolute-PE checkpoints,
-# so training starts from scratch by default.
-RESUME_TRAINING = True
+# The RMSNorm/SwiGLU/KV-cache architecture is incompatible with old checkpoints.
+RESUME_TRAINING = False
 
-# Sequences are tokenized at 2048. Attention memory scales ~O(L^2); set this
-# (e.g. 1024) to truncate long sequences and cut VRAM. None keeps full length.
-MAX_SEQ_LEN: int | None = None
+# Sequences are packed to PACK_SEQ_LEN (4096 tokens). Attention uses is_causal=True
+# with no padding mask — packed rows are dense token streams.
+PACK_SEQ_LEN = 4096
 
 USE_WANDB = True
 WANDB_PROJECT = "ai-music-project"
@@ -105,11 +103,117 @@ def restore_rng_state(rng_state: dict[str, Any]) -> None:
         torch.cuda.set_rng_state_all(rng_state["cuda"])
 
 
+def unpack_sequences(input_ids: Tensor, attention_mask: Tensor) -> list[Tensor]:
+    sequences: list[Tensor] = []
+    for index in range(input_ids.shape[0]):
+        length = int(attention_mask[index].sum().item())
+        if length > 1:
+            sequences.append(input_ids[index, :length].clone())
+    return sequences
+
+
+def pack_sequences(
+    sequences: list[Tensor],
+    pack_seq_len: int,
+    ignore_index: int,
+) -> tuple[Tensor, Tensor]:
+    packed_inputs: list[Tensor] = []
+    packed_targets: list[Tensor] = []
+
+    buffer: list[int] = []
+    doc_starts: list[int] = [0]
+
+    def emit_full_rows() -> None:
+        nonlocal buffer, doc_starts
+        while len(buffer) >= pack_seq_len:
+            row = buffer[:pack_seq_len]
+            buffer = buffer[pack_seq_len:]
+            row_starts = [start for start in doc_starts if start < pack_seq_len]
+            doc_starts = [start - pack_seq_len for start in doc_starts if start >= pack_seq_len]
+            if buffer:
+                if not doc_starts or doc_starts[0] != 0:
+                    doc_starts = [0, *doc_starts]
+            else:
+                doc_starts = [0]
+
+            row_tensor = torch.tensor(row, dtype=torch.long)
+            inputs = row_tensor[:-1]
+            targets = row_tensor[1:].clone()
+            for start in row_starts[1:]:
+                if start > 0:
+                    targets[start - 1] = ignore_index
+
+            packed_inputs.append(inputs)
+            packed_targets.append(targets)
+
+    for sequence in sequences:
+        tokens = sequence.tolist()
+        if not tokens:
+            continue
+
+        if buffer:
+            doc_starts.append(len(buffer))
+        buffer.extend(tokens)
+        emit_full_rows()
+
+    if not packed_inputs:
+        raise ValueError("No packed sequences were created")
+
+    if buffer:
+        logger.warning(
+            "Dropped %d trailing tokens that do not fill a %d-token packed row",
+            len(buffer),
+            pack_seq_len,
+        )
+
+    return torch.stack(packed_inputs), torch.stack(packed_targets)
+
+
+class PackedMusicDataset(torch.utils.data.Dataset[tuple[Tensor, Tensor]]):
+    def __init__(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor,
+        pack_seq_len: int,
+        pad_token_id: int,
+        pitch_shift_maps: dict[int, Tensor] | None = None,
+        augment: bool = False,
+        min_shift: int = -6,
+        max_shift: int = 5,
+    ) -> None:
+        sequences = unpack_sequences(input_ids, attention_mask)
+        self.inputs, self.targets = pack_sequences(
+            sequences,
+            pack_seq_len,
+            pad_token_id,
+        )
+        self.pitch_shift_maps = pitch_shift_maps
+        self.augment = augment
+        self.min_shift = min_shift
+        self.max_shift = max_shift
+        self.pad_token_id = pad_token_id
+
+    def __len__(self) -> int:
+        return self.inputs.shape[0]
+
+    def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:
+        inputs = self.inputs[index]
+        targets = self.targets[index]
+        if self.augment and self.pitch_shift_maps is not None:
+            shift = random.randint(self.min_shift, self.max_shift)
+            mapping = self.pitch_shift_maps[shift]
+            inputs = mapping[inputs]
+            targets = targets.clone()
+            valid = targets != self.pad_token_id
+            targets[valid] = mapping[targets[valid]]
+        return inputs, targets
+
+
 def load_datasets(
     train_tokens_path: Path,
     val_tokens_path: Path,
     tokenizer_path: Path,
-) -> tuple[MusicDataset, MusicDataset, int, int]:
+) -> tuple[PackedMusicDataset, PackedMusicDataset, int, int]:
     if not train_tokens_path.exists():
         raise FileNotFoundError(f"Training tokens not found: {train_tokens_path}")
     if not val_tokens_path.exists():
@@ -146,8 +250,21 @@ def load_datasets(
         )
 
     pitch_shift_maps = build_pitch_shift_maps(tokenizer, vocab_size)
-    train_dataset = MusicDataset(train_ids, train_mask, pitch_shift_maps)
-    val_dataset = MusicDataset(val_ids, val_mask)
+    train_dataset = PackedMusicDataset(
+        train_ids,
+        train_mask,
+        PACK_SEQ_LEN,
+        pad_token_id,
+        pitch_shift_maps,
+        augment=True,
+    )
+    val_dataset = PackedMusicDataset(
+        val_ids,
+        val_mask,
+        PACK_SEQ_LEN,
+        pad_token_id,
+        augment=False,
+    )
     return train_dataset, val_dataset, vocab_size, pad_token_id
 
 
@@ -278,7 +395,7 @@ def init_wandb(
             "max_grad_norm": MAX_GRAD_NORM,
             "seed": SEED,
             "num_workers": NUM_WORKERS,
-            "max_seq_len": MAX_SEQ_LEN,
+            "max_seq_len": PACK_SEQ_LEN,
             "resume_training": RESUME_TRAINING,
             "device": str(device),
             "vocab_size": vocab_size,
@@ -319,25 +436,16 @@ def train_one_epoch(
     vocab_size = unwrap_model(model).vocab_size
 
     optimizer.zero_grad(set_to_none=True)
-    for step, (inputs, targets, mask) in enumerate(dataloader):
+    for step, (inputs, targets) in enumerate(dataloader):
         inputs = inputs.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
-        mask = mask.to(device, non_blocking=True)
-        if MAX_SEQ_LEN is not None:
-            context_length = max(MAX_SEQ_LEN - 1, 1)
-            inputs = inputs[:, :context_length]
-            targets = targets[:, :context_length]
-            mask = mask[:, :context_length]
 
         assert inputs.shape == targets.shape, (
             f"Got inputs={inputs.shape}, targets={targets.shape}"
         )
-        assert mask.shape == inputs.shape, (
-            f"Got mask={mask.shape}, inputs={inputs.shape}"
-        )
 
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-            logits = model(inputs, attention_mask=mask)
+            logits, _ = model(inputs)
             loss = F.cross_entropy(
                 logits.reshape(-1, vocab_size),
                 targets.reshape(-1),
@@ -402,21 +510,12 @@ def validate(
     vocab_size = unwrap_model(model).vocab_size
 
     with torch.no_grad():
-        for inputs, targets, mask in val_loader:
+        for inputs, targets in val_loader:
             inputs = inputs.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
-            mask = mask.to(device, non_blocking=True)
-            if MAX_SEQ_LEN is not None:
-                context_length = max(MAX_SEQ_LEN - 1, 1)
-                inputs = inputs[:, :context_length]
-                targets = targets[:, :context_length]
-                mask = mask[:, :context_length]
 
             assert inputs.shape == targets.shape, (
                 f"Got inputs={inputs.shape}, targets={targets.shape}"
-            )
-            assert mask.shape == inputs.shape, (
-                f"Got mask={mask.shape}, inputs={inputs.shape}"
             )
 
             with torch.autocast(
@@ -424,7 +523,7 @@ def validate(
                 dtype=amp_dtype,
                 enabled=use_amp,
             ):
-                logits = model(inputs, attention_mask=mask)
+                logits, _ = model(inputs)
                 loss = F.cross_entropy(
                     logits.reshape(-1, vocab_size),
                     targets.reshape(-1),
@@ -477,8 +576,10 @@ def main() -> None:
         TOKENIZER_PATH,
     )
     logger.info(
-        "Loaded train=%d | validation=%d | vocab_size=%d | pad_token_id=%d",
+        "Loaded train=%d packed=%d | validation=%d packed=%d | vocab_size=%d | pad_token_id=%d",
+        len(train_ids),
         len(train_dataset),
+        len(val_ids),
         len(val_dataset),
         vocab_size,
         pad_token_id,
