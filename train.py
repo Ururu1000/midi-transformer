@@ -15,7 +15,10 @@ from torch.utils.data import DataLoader
 from model import MusicTransformer, get_device
 from scripts.tokenize_midi import (
     ComposerREMI,
+    POSITIONS_PER_BEAT,
+    UNCONDITIONAL_COMPOSER,
     build_pitch_shift_maps,
+    composer_vocab_token,
 )
 
 TRAIN_TOKENS_PATH = Path("data/processed/tokens_train.pt")
@@ -24,21 +27,23 @@ TOKENIZER_PATH = Path("data/processed/tokenizer.json")
 CHECKPOINTS_DIR = Path("checkpoints")
 CHECKPOINT_PATTERN = re.compile(r"model_epoch_(\d+)\.pt$")
 
-# Tuned for an NVIDIA L4 (16GB VRAM): a 113M param model fits batch 120 at
-# seq_len 2048, so no gradient accumulation is needed.
+# L4 24GB: seq 4096 attention is ~4x seq 2048. Batch 12 + accum 7 ≈ effective 84.
 BATCH_SIZE = 12
 # MPS/CPU have no flash-attention kernel, so SDPA materializes the full
-# (batch, heads, seq, seq) score matrix; batch 120 needs ~18GB there. This
-# smaller batch keeps local smoke tests on a MacBook within memory.
+# (batch, heads, seq, seq) score matrix. Keep local smoke tests tiny.
 LOCAL_BATCH_SIZE = 1
-GRADIENT_ACCUMULATION_STEPS = 10
-NUM_EPOCHS = 5
-WARMUP_EPOCHS = 1
+GRADIENT_ACCUMULATION_STEPS = 7
+NUM_EPOCHS = 50
+WARMUP_EPOCHS = 5
 LEARNING_RATE = 3e-4
 WEIGHT_DECAY = 0.01
 MAX_GRAD_NORM = 1.0
 LOG_EVERY = 10
 SEED = 42
+
+# Fraction of training rows whose composer tokens are swapped for the
+# unconditional token, so the same weights model p(x) and p(x | composer).
+CFG_DROP_PROB = 0.15
 
 # DataLoader workers for the Linux VM; pinned memory speeds up host->GPU copies.
 NUM_WORKERS = 4
@@ -49,6 +54,7 @@ RESUME_TRAINING = False
 # Sequences are packed to PACK_SEQ_LEN (4096 tokens). Attention uses is_causal=True
 # with no padding mask — packed rows are dense token streams.
 PACK_SEQ_LEN = 4096
+EXPECTED_BEAT_RES = {(0, 4): POSITIONS_PER_BEAT, (4, 12): POSITIONS_PER_BEAT}
 
 USE_WANDB = True
 WANDB_PROJECT = "ai-music-project"
@@ -58,6 +64,32 @@ WANDB_RUN_NAME: str | None = None
 WANDB_MODE = "online"
 
 logger = logging.getLogger(__name__)
+
+
+def assert_tokenizer_matches_training_config(tokenizer: ComposerREMI) -> None:
+    """Refuse stale tokenizer/tokens from before rests/chords/beat_res=12."""
+    config = tokenizer.config
+    beat_res = dict(config.beat_res)
+    problems: list[str] = []
+    if beat_res != EXPECTED_BEAT_RES:
+        problems.append(f"beat_res={beat_res} expected={EXPECTED_BEAT_RES}")
+    if not config.use_rests:
+        problems.append("use_rests=False expected True")
+    if not config.use_chords:
+        problems.append("use_chords=False expected True")
+    rest_count = sum(1 for token in tokenizer.vocab if token.startswith("Rest_"))
+    chord_count = sum(1 for token in tokenizer.vocab if token.startswith("Chord_"))
+    if rest_count == 0:
+        problems.append("no Rest_* tokens in vocab")
+    if chord_count == 0:
+        problems.append("no Chord_* tokens in vocab")
+
+    if problems:
+        raise ValueError(
+            "Stale tokenizer/tokens detected. Re-run "
+            "`python3 scripts/tokenize_midi.py` before training. "
+            + "; ".join(problems)
+        )
 
 
 def set_seed(seed: int) -> None:
@@ -176,6 +208,9 @@ class PackedMusicDataset(torch.utils.data.Dataset[tuple[Tensor, Tensor]]):
         attention_mask: Tensor,
         pack_seq_len: int,
         pad_token_id: int,
+        composer_ids: set[int],
+        uncond_id: int,
+        cfg_drop_prob: float,
         pitch_shift_maps: dict[int, Tensor] | None = None,
         augment: bool = False,
         min_shift: int = -6,
@@ -192,6 +227,9 @@ class PackedMusicDataset(torch.utils.data.Dataset[tuple[Tensor, Tensor]]):
         self.min_shift = min_shift
         self.max_shift = max_shift
         self.pad_token_id = pad_token_id
+        self.composer_ids = torch.tensor(sorted(composer_ids), dtype=torch.long)
+        self.uncond_id = uncond_id
+        self.cfg_drop_prob = cfg_drop_prob
 
     def __len__(self) -> int:
         return self.inputs.shape[0]
@@ -206,7 +244,39 @@ class PackedMusicDataset(torch.utils.data.Dataset[tuple[Tensor, Tensor]]):
             targets = targets.clone()
             valid = targets != self.pad_token_id
             targets[valid] = mapping[targets[valid]]
+
+        if (
+            self.cfg_drop_prob > 0.0
+            and self.composer_ids.numel() > 0
+            and random.random() < self.cfg_drop_prob
+        ):
+            # Only the conditioning the model reads is dropped; targets stay
+            # untouched so the loss keeps scoring the same token stream.
+            inputs = inputs.clone()
+            inputs[torch.isin(inputs, self.composer_ids)] = self.uncond_id
+
         return inputs, targets
+
+
+def resolve_composer_token_ids(tokenizer: ComposerREMI) -> tuple[set[int], int]:
+    uncond_token = composer_vocab_token(UNCONDITIONAL_COMPOSER)
+    if uncond_token not in tokenizer.vocab:
+        raise ValueError(
+            f"Tokenizer has no {uncond_token} token. Re-run "
+            "`python3 scripts/tokenize_midi.py` to rebuild the vocabulary "
+            "with classifier-free guidance support."
+        )
+
+    uncond_id = int(tokenizer.vocab[uncond_token])
+    composer_ids = {
+        int(token_id)
+        for token, token_id in tokenizer.vocab.items()
+        if token.startswith("Composer_") and token != uncond_token
+    }
+    if not composer_ids:
+        raise ValueError("Tokenizer has no conditional Composer_* tokens")
+
+    return composer_ids, uncond_id
 
 
 def load_datasets(
@@ -248,6 +318,15 @@ def load_datasets(
         raise ValueError(
             f"Tokenizer vocab_size={len(tokenizer)} != data vocab_size={vocab_size}"
         )
+    assert_tokenizer_matches_training_config(tokenizer)
+
+    composer_ids, uncond_id = resolve_composer_token_ids(tokenizer)
+    logger.info(
+        "Composer conditioning: %d tokens | uncond_id=%d | cfg_drop_prob=%.2f",
+        len(composer_ids),
+        uncond_id,
+        CFG_DROP_PROB,
+    )
 
     pitch_shift_maps = build_pitch_shift_maps(tokenizer, vocab_size)
     train_dataset = PackedMusicDataset(
@@ -255,6 +334,9 @@ def load_datasets(
         train_mask,
         PACK_SEQ_LEN,
         pad_token_id,
+        composer_ids,
+        uncond_id,
+        CFG_DROP_PROB,
         pitch_shift_maps,
         augment=True,
     )
@@ -263,6 +345,9 @@ def load_datasets(
         val_mask,
         PACK_SEQ_LEN,
         pad_token_id,
+        composer_ids,
+        uncond_id,
+        cfg_drop_prob=0.0,
         augment=False,
     )
     return train_dataset, val_dataset, vocab_size, pad_token_id
@@ -394,6 +479,7 @@ def init_wandb(
             "weight_decay": WEIGHT_DECAY,
             "max_grad_norm": MAX_GRAD_NORM,
             "seed": SEED,
+            "cfg_drop_prob": CFG_DROP_PROB,
             "num_workers": NUM_WORKERS,
             "max_seq_len": PACK_SEQ_LEN,
             "resume_training": RESUME_TRAINING,
@@ -576,10 +662,8 @@ def main() -> None:
         TOKENIZER_PATH,
     )
     logger.info(
-        "Loaded train=%d packed=%d | validation=%d packed=%d | vocab_size=%d | pad_token_id=%d",
-        len(train_ids),
+        "Loaded train=%d | validation=%d | vocab_size=%d | pad_token_id=%d",
         len(train_dataset),
-        len(val_ids),
         len(val_dataset),
         vocab_size,
         pad_token_id,
