@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import random
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -14,11 +15,12 @@ from torch.utils.data import DataLoader
 
 from model import MusicTransformer, get_device
 from scripts.tokenize_midi import (
+    DOCS_FORMAT,
     ComposerREMI,
     POSITIONS_PER_BEAT,
     UNCONDITIONAL_COMPOSER,
-    build_pitch_shift_maps,
     composer_vocab_token,
+    learned_token_id,
 )
 
 TRAIN_TOKENS_PATH = Path("data/processed/tokens_train.pt")
@@ -28,6 +30,8 @@ CHECKPOINTS_DIR = Path("checkpoints")
 CHECKPOINT_PATTERN = re.compile(r"model_epoch_(\d+)\.pt$")
 
 # L4 24GB: seq 4096 attention is ~4x seq 2048. Batch 12 + accum 7 ≈ effective 84.
+# The block-diagonal attn_mask routes SDPA to the memory-efficient backend
+# (flash kernels reject arbitrary masks); drop to 8 if the L4 OOMs.
 BATCH_SIZE = 12
 # MPS/CPU have no flash-attention kernel, so SDPA materializes the full
 # (batch, heads, seq, seq) score matrix. Keep local smoke tests tiny.
@@ -51,8 +55,9 @@ NUM_WORKERS = 4
 # The RMSNorm/SwiGLU/KV-cache architecture is incompatible with old checkpoints.
 RESUME_TRAINING = False
 
-# Sequences are packed to PACK_SEQ_LEN (4096 tokens). Attention uses is_causal=True
-# with no padding mask — packed rows are dense token streams.
+# Whole documents are bin-packed into PACK_SEQ_LEN rows. Every row carries
+# doc_ids so attention is block-diagonal: no token ever attends across a
+# document boundary or into padding.
 PACK_SEQ_LEN = 4096
 EXPECTED_BEAT_RES = {(0, 4): POSITIONS_PER_BEAT, (4, 12): POSITIONS_PER_BEAT}
 
@@ -135,148 +140,114 @@ def restore_rng_state(rng_state: dict[str, Any]) -> None:
         torch.cuda.set_rng_state_all(rng_state["cuda"])
 
 
-def unpack_sequences(input_ids: Tensor, attention_mask: Tensor) -> list[Tensor]:
-    sequences: list[Tensor] = []
-    for index in range(input_ids.shape[0]):
-        length = int(attention_mask[index].sum().item())
-        if length > 1:
-            sequences.append(input_ids[index, :length].clone())
-    return sequences
+@dataclass(frozen=True)
+class PackedSegment:
+    doc_index: int
+    row_offset: int
+    slot_len: int
 
 
-def pack_sequences(
-    sequences: list[Tensor],
-    pack_seq_len: int,
-    ignore_index: int,
-) -> tuple[Tensor, Tensor]:
-    packed_inputs: list[Tensor] = []
-    packed_targets: list[Tensor] = []
+class PackedMusicDataset(torch.utils.data.Dataset[tuple[Tensor, Tensor, Tensor]]):
+    """Bin-packs whole documents into fixed rows with block-diagonal doc_ids.
 
-    buffer: list[int] = []
-    doc_starts: list[int] = [0]
+    Every document arrives as a set of pre-encoded BPE variants, one per pitch
+    shift. Augmentation therefore happens strictly per document, before the
+    document lands in a packed row: each segment in a row draws its own shift.
+    Row slots are sized from the unshifted variant; a shifted encoding that
+    ends up longer is truncated to its slot, a shorter one leaves padding that
+    the attention mask and loss both ignore.
+    """
 
-    def emit_full_rows() -> None:
-        nonlocal buffer, doc_starts
-        while len(buffer) >= pack_seq_len:
-            row = buffer[:pack_seq_len]
-            buffer = buffer[pack_seq_len:]
-            row_starts = [start for start in doc_starts if start < pack_seq_len]
-            doc_starts = [start - pack_seq_len for start in doc_starts if start >= pack_seq_len]
-            if buffer:
-                if not doc_starts or doc_starts[0] != 0:
-                    doc_starts = [0, *doc_starts]
-            else:
-                doc_starts = [0]
+    # Sentinel doc id for padding: never equal to any segment ordinal, so real
+    # tokens cannot attend into padding.
+    PAD_DOC_ID = -1
 
-            row_tensor = torch.tensor(row, dtype=torch.long)
-            inputs = row_tensor[:-1]
-            targets = row_tensor[1:].clone()
-            for start in row_starts[1:]:
-                if start > 0:
-                    targets[start - 1] = ignore_index
-
-            packed_inputs.append(inputs)
-            packed_targets.append(targets)
-
-    for sequence in sequences:
-        tokens = sequence.tolist()
-        if not tokens:
-            continue
-
-        if buffer:
-            doc_starts.append(len(buffer))
-        buffer.extend(tokens)
-        emit_full_rows()
-
-    if not packed_inputs:
-        raise ValueError("No packed sequences were created")
-
-    if buffer:
-        logger.warning(
-            "Dropped %d trailing tokens that do not fill a %d-token packed row",
-            len(buffer),
-            pack_seq_len,
-        )
-
-    return torch.stack(packed_inputs), torch.stack(packed_targets)
-
-
-class PackedMusicDataset(torch.utils.data.Dataset[tuple[Tensor, Tensor]]):
     def __init__(
         self,
-        input_ids: Tensor,
-        attention_mask: Tensor,
+        docs: list[dict[str, Any]],
         pack_seq_len: int,
         pad_token_id: int,
-        composer_ids: set[int],
         uncond_id: int,
         cfg_drop_prob: float,
-        pitch_shift_maps: dict[int, Tensor] | None = None,
-        augment: bool = False,
-        min_shift: int = -6,
-        max_shift: int = 5,
+        shifts: list[int],
+        augment: bool,
     ) -> None:
-        sequences = unpack_sequences(input_ids, attention_mask)
-        self.inputs, self.targets = pack_sequences(
-            sequences,
-            pack_seq_len,
-            pad_token_id,
-        )
-        self.pitch_shift_maps = pitch_shift_maps
-        self.augment = augment
-        self.min_shift = min_shift
-        self.max_shift = max_shift
+        assert docs, "Cannot pack an empty document list"
+        assert 0 in shifts, f"Shift variants must include 0, got {shifts}"
+
+        self.docs = docs
+        self.pack_seq_len = pack_seq_len
         self.pad_token_id = pad_token_id
-        self.composer_ids = torch.tensor(sorted(composer_ids), dtype=torch.long)
         self.uncond_id = uncond_id
         self.cfg_drop_prob = cfg_drop_prob
+        self.shifts = list(shifts)
+        self.augment = augment
+
+        self.rows: list[list[PackedSegment]] = []
+        current_row: list[PackedSegment] = []
+        cursor = 0
+        for doc_index, doc in enumerate(self.docs):
+            # +1 for the composer prefix written at __getitem__ time.
+            slot_len = min(int(doc["variants"][0].numel()) + 1, pack_seq_len)
+            if cursor + slot_len > pack_seq_len:
+                self.rows.append(current_row)
+                current_row = []
+                cursor = 0
+            current_row.append(PackedSegment(doc_index, cursor, slot_len))
+            cursor += slot_len
+        if current_row:
+            self.rows.append(current_row)
 
     def __len__(self) -> int:
-        return self.inputs.shape[0]
+        return len(self.rows)
 
-    def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:
-        inputs = self.inputs[index]
-        targets = self.targets[index]
-        if self.augment and self.pitch_shift_maps is not None:
-            shift = random.randint(self.min_shift, self.max_shift)
-            mapping = self.pitch_shift_maps[shift]
-            inputs = mapping[inputs]
-            targets = targets.clone()
-            valid = targets != self.pad_token_id
-            targets[valid] = mapping[targets[valid]]
+    def __getitem__(self, index: int) -> tuple[Tensor, Tensor, Tensor]:
+        row = torch.full((self.pack_seq_len,), self.pad_token_id, dtype=torch.long)
+        doc_ids = torch.full((self.pack_seq_len,), self.PAD_DOC_ID, dtype=torch.long)
+        # One coin per row: the whole row is either conditioned or unconditioned,
+        # matching how classifier-free guidance runs at inference.
+        drop_conditioning = self.cfg_drop_prob > 0.0 and random.random() < self.cfg_drop_prob
 
-        if (
-            self.cfg_drop_prob > 0.0
-            and self.composer_ids.numel() > 0
-            and random.random() < self.cfg_drop_prob
-        ):
-            # Only the conditioning the model reads is dropped; targets stay
-            # untouched so the loss keeps scoring the same token stream.
-            inputs = inputs.clone()
-            inputs[torch.isin(inputs, self.composer_ids)] = self.uncond_id
+        segments = self.rows[index]
+        for ordinal, segment in enumerate(segments):
+            doc = self.docs[segment.doc_index]
+            shift = random.choice(self.shifts) if self.augment else 0
+            prefix_id = self.uncond_id if drop_conditioning else int(doc["composer_id"])
+            variant = doc["variants"][shift].long()
+            content = torch.cat(
+                [torch.tensor([prefix_id], dtype=torch.long), variant]
+            )
+            fit = min(int(content.numel()), segment.slot_len)
+            start = segment.row_offset
+            row[start : start + fit] = content[:fit]
+            doc_ids[start : start + fit] = ordinal
 
-        return inputs, targets
+        inputs = row[:-1]
+        targets = row[1:].clone()
+        input_doc_ids = doc_ids[:-1]
+        # The position just before a document start would otherwise be scored on
+        # predicting the next document's composer prefix.
+        for segment in segments:
+            if segment.row_offset > 0:
+                targets[segment.row_offset - 1] = self.pad_token_id
+
+        expected_shape = (self.pack_seq_len - 1,)
+        assert inputs.shape == expected_shape, f"Got {inputs.shape}"
+        assert targets.shape == expected_shape, f"Got {targets.shape}"
+        assert input_doc_ids.shape == expected_shape, f"Got {input_doc_ids.shape}"
+        return inputs, targets, input_doc_ids
 
 
-def resolve_composer_token_ids(tokenizer: ComposerREMI) -> tuple[set[int], int]:
-    uncond_token = composer_vocab_token(UNCONDITIONAL_COMPOSER)
-    if uncond_token not in tokenizer.vocab:
+def load_docs_checkpoint(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"Tokenized documents not found: {path}")
+    checkpoint = torch.load(path, map_location="cpu")
+    if checkpoint.get("format") != DOCS_FORMAT:
         raise ValueError(
-            f"Tokenizer has no {uncond_token} token. Re-run "
-            "`python3 scripts/tokenize_midi.py` to rebuild the vocabulary "
-            "with classifier-free guidance support."
+            f"{path} has format={checkpoint.get('format')!r}, expected "
+            f"{DOCS_FORMAT!r}. Re-run `python3 scripts/tokenize_midi.py`."
         )
-
-    uncond_id = int(tokenizer.vocab[uncond_token])
-    composer_ids = {
-        int(token_id)
-        for token, token_id in tokenizer.vocab.items()
-        if token.startswith("Composer_") and token != uncond_token
-    }
-    if not composer_ids:
-        raise ValueError("Tokenizer has no conditional Composer_* tokens")
-
-    return composer_ids, uncond_id
+    return checkpoint
 
 
 def load_datasets(
@@ -284,27 +255,8 @@ def load_datasets(
     val_tokens_path: Path,
     tokenizer_path: Path,
 ) -> tuple[PackedMusicDataset, PackedMusicDataset, int, int]:
-    if not train_tokens_path.exists():
-        raise FileNotFoundError(f"Training tokens not found: {train_tokens_path}")
-    if not val_tokens_path.exists():
-        raise FileNotFoundError(f"Validation tokens not found: {val_tokens_path}")
-
-    train_checkpoint = torch.load(train_tokens_path, map_location="cpu")
-    val_checkpoint = torch.load(val_tokens_path, map_location="cpu")
-
-    train_ids = train_checkpoint["input_ids"].long()
-    train_mask = train_checkpoint["attention_mask"].bool()
-    val_ids = val_checkpoint["input_ids"].long()
-    val_mask = val_checkpoint["attention_mask"].bool()
-
-    assert train_ids.ndim == 2, f"Got train input_ids={train_ids.shape}"
-    assert val_ids.ndim == 2, f"Got val input_ids={val_ids.shape}"
-    assert train_mask.shape == train_ids.shape, (
-        f"Got train input_ids={train_ids.shape}, attention_mask={train_mask.shape}"
-    )
-    assert val_mask.shape == val_ids.shape, (
-        f"Got val input_ids={val_ids.shape}, attention_mask={val_mask.shape}"
-    )
+    train_checkpoint = load_docs_checkpoint(train_tokens_path)
+    val_checkpoint = load_docs_checkpoint(val_tokens_path)
 
     vocab_size = int(train_checkpoint["vocab_size"])
     pad_token_id = int(train_checkpoint["pad_token_id"])
@@ -314,40 +266,42 @@ def load_datasets(
         raise ValueError("Train and validation pad_token_id values do not match")
 
     tokenizer = ComposerREMI(params=str(tokenizer_path))
+    if not tokenizer.is_trained:
+        raise ValueError(
+            "Tokenizer has no trained BPE model. Re-run "
+            "`python3 scripts/tokenize_midi.py`."
+        )
     if len(tokenizer) != vocab_size:
         raise ValueError(
             f"Tokenizer vocab_size={len(tokenizer)} != data vocab_size={vocab_size}"
         )
     assert_tokenizer_matches_training_config(tokenizer)
 
-    composer_ids, uncond_id = resolve_composer_token_ids(tokenizer)
+    uncond_id = learned_token_id(
+        tokenizer, composer_vocab_token(UNCONDITIONAL_COMPOSER)
+    )
     logger.info(
-        "Composer conditioning: %d tokens | uncond_id=%d | cfg_drop_prob=%.2f",
-        len(composer_ids),
+        "Composer conditioning: uncond_id=%d | cfg_drop_prob=%.2f",
         uncond_id,
         CFG_DROP_PROB,
     )
 
-    pitch_shift_maps = build_pitch_shift_maps(tokenizer, vocab_size)
     train_dataset = PackedMusicDataset(
-        train_ids,
-        train_mask,
+        train_checkpoint["docs"],
         PACK_SEQ_LEN,
         pad_token_id,
-        composer_ids,
         uncond_id,
         CFG_DROP_PROB,
-        pitch_shift_maps,
+        shifts=list(train_checkpoint["shifts"]),
         augment=True,
     )
     val_dataset = PackedMusicDataset(
-        val_ids,
-        val_mask,
+        val_checkpoint["docs"],
         PACK_SEQ_LEN,
         pad_token_id,
-        composer_ids,
         uncond_id,
         cfg_drop_prob=0.0,
+        shifts=list(val_checkpoint["shifts"]),
         augment=False,
     )
     return train_dataset, val_dataset, vocab_size, pad_token_id
@@ -522,16 +476,18 @@ def train_one_epoch(
     vocab_size = unwrap_model(model).vocab_size
 
     optimizer.zero_grad(set_to_none=True)
-    for step, (inputs, targets) in enumerate(dataloader):
+    for step, (inputs, targets, doc_ids) in enumerate(dataloader):
         inputs = inputs.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
+        doc_ids = doc_ids.to(device, non_blocking=True)
 
-        assert inputs.shape == targets.shape, (
-            f"Got inputs={inputs.shape}, targets={targets.shape}"
+        assert inputs.shape == targets.shape == doc_ids.shape, (
+            f"Got inputs={inputs.shape}, targets={targets.shape}, "
+            f"doc_ids={doc_ids.shape}"
         )
 
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-            logits, _ = model(inputs)
+            logits, _ = model(inputs, doc_ids=doc_ids)
             loss = F.cross_entropy(
                 logits.reshape(-1, vocab_size),
                 targets.reshape(-1),
@@ -596,12 +552,14 @@ def validate(
     vocab_size = unwrap_model(model).vocab_size
 
     with torch.no_grad():
-        for inputs, targets in val_loader:
+        for inputs, targets, doc_ids in val_loader:
             inputs = inputs.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
+            doc_ids = doc_ids.to(device, non_blocking=True)
 
-            assert inputs.shape == targets.shape, (
-                f"Got inputs={inputs.shape}, targets={targets.shape}"
+            assert inputs.shape == targets.shape == doc_ids.shape, (
+                f"Got inputs={inputs.shape}, targets={targets.shape}, "
+                f"doc_ids={doc_ids.shape}"
             )
 
             with torch.autocast(
@@ -609,7 +567,7 @@ def validate(
                 dtype=amp_dtype,
                 enabled=use_amp,
             ):
-                logits, _ = model(inputs)
+                logits, _ = model(inputs, doc_ids=doc_ids)
                 loss = F.cross_entropy(
                     logits.reshape(-1, vocab_size),
                     targets.reshape(-1),

@@ -2,18 +2,17 @@ from __future__ import annotations
 
 import json
 import logging
-import random
 import re
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import pretty_midi
 import torch
 from miditok import REMI, TokSequence, TokenizerConfig
 from torch import Tensor
-from torch.utils.data import Dataset
 
 MAX_SEQ_LEN = 4096
 CHUNK_STRIDE = 2048
@@ -36,9 +35,19 @@ RESERVED_COMPOSERS = (OTHER_COMPOSER, UNCONDITIONAL_COMPOSER)
 # 12 positions per beat -> triplet / rubato-friendly 1/12 quantization.
 POSITIONS_PER_BEAT = 12
 
-# Pitch-shift augmentation range (semitones), applied on the fly per sample.
+# BPE target vocabulary. Merges frequent note/rhythm patterns into single ids,
+# so a fixed 4096-token window covers substantially more music.
+BPE_VOCAB_SIZE = 2048
+
+# Pitch-shift augmentation range (semitones). BPE ids cannot be transposed
+# directly (one id may span several notes), so every transposition is encoded
+# at tokenization time and train.py picks a variant per document per sample.
 MIN_PITCH_SHIFT = -6
 MAX_PITCH_SHIFT = 5
+TRAIN_SHIFTS = tuple(range(MIN_PITCH_SHIFT, MAX_PITCH_SHIFT + 1))
+VAL_SHIFTS = (0,)
+
+DOCS_FORMAT = "docs_v2_bpe"
 
 logger = logging.getLogger(__name__)
 
@@ -129,12 +138,42 @@ def save_composer_mapping(mapping: dict[str, str], output_path: Path) -> None:
     )
 
 
+def learned_token_id(tokenizer: REMI, token: str) -> int:
+    """Id of a single base token in the vocabulary the model actually sees.
+
+    Special and composer tokens never appear inside BPE merges (they are absent
+    from the MIDI training corpus), so each keeps an atomic id in the learned
+    vocabulary. Looked up through the byte mapping because miditok's
+    ``encode_token_ids`` is only defined for full musical sequences.
+    """
+    if token not in tokenizer.vocab:
+        raise KeyError(f"Token {token!r} missing from base vocabulary")
+    base_id = int(tokenizer.vocab[token])
+    if not tokenizer.is_trained:
+        return base_id
+
+    byte_form = tokenizer._ids_to_bytes([base_id], as_one_str=True)
+    learned_id = tokenizer.vocab_model.get(byte_form)
+    if learned_id is None:
+        raise ValueError(f"Token {token!r} is not atomic in the learned vocabulary")
+    return int(learned_id)
+
+
+def encode_base_ids_batch(
+    tokenizer: REMI,
+    base_ids_batch: list[list[int]],
+) -> list[list[int]]:
+    sequences = [TokSequence(ids=list(ids)) for ids in base_ids_batch]
+    tokenizer.encode_token_ids(sequences)
+    return [list(sequence.ids) for sequence in sequences]
+
+
 def build_pitch_shift_maps(
     tokenizer: REMI,
-    vocab_size: int,
     min_shift: int = MIN_PITCH_SHIFT,
     max_shift: int = MAX_PITCH_SHIFT,
 ) -> dict[int, Tensor]:
+    """Base-vocabulary id remap tensors, one per transposition."""
     pitch_token_ids = {
         int(token.split("_")[1]): token_id
         for token, token_id in tokenizer.vocab.items()
@@ -142,60 +181,18 @@ def build_pitch_shift_maps(
     }
     assert pitch_token_ids, "No Pitch_* tokens found in tokenizer vocabulary"
 
+    base_vocab_size = len(tokenizer.vocab)
     lowest, highest = min(pitch_token_ids), max(pitch_token_ids)
     shift_maps: dict[int, Tensor] = {}
     for shift in range(min_shift, max_shift + 1):
         # Identity mapping; only Pitch ids are redirected to the transposed pitch.
-        mapping = torch.arange(vocab_size, dtype=torch.long)
+        mapping = torch.arange(base_vocab_size, dtype=torch.long)
         for pitch, token_id in pitch_token_ids.items():
             # Clamp so transposition never leaves the tokenizer's pitch range.
             shifted = min(max(pitch + shift, lowest), highest)
             mapping[token_id] = pitch_token_ids[shifted]
         shift_maps[shift] = mapping
     return shift_maps
-
-
-class MusicDataset(Dataset[tuple[Tensor, Tensor, Tensor]]):
-    def __init__(
-        self,
-        input_ids: Tensor,
-        attention_mask: Tensor,
-        pitch_shift_maps: dict[int, Tensor] | None = None,
-        min_shift: int = MIN_PITCH_SHIFT,
-        max_shift: int = MAX_PITCH_SHIFT,
-    ) -> None:
-        assert input_ids.ndim == 2, f"Got {input_ids.shape}"
-        assert attention_mask.shape == input_ids.shape, (
-            f"Got input_ids={input_ids.shape}, attention_mask={attention_mask.shape}"
-        )
-
-        self.input_ids = input_ids.long()
-        self.attention_mask = attention_mask.bool()
-        self.seq_len = input_ids.shape[1]
-        self.pitch_shift_maps = pitch_shift_maps
-        self.min_shift = min_shift
-        self.max_shift = max_shift
-
-    def __len__(self) -> int:
-        return self.input_ids.shape[0]
-
-    def __getitem__(self, index: int) -> tuple[Tensor, Tensor, Tensor]:
-        sequence = self.input_ids[index]
-        mask = self.attention_mask[index]
-        if self.pitch_shift_maps is not None:
-            shift = random.randint(self.min_shift, self.max_shift)
-            sequence = self.pitch_shift_maps[shift][sequence]
-
-        assert sequence.shape == (self.seq_len,), f"Got {sequence.shape}"
-        assert mask.shape == (self.seq_len,), f"Got {mask.shape}"
-        inputs = sequence[:-1]
-        targets = sequence[1:]
-        input_mask = mask[:-1]
-        expected_shape = (self.seq_len - 1,)
-        assert inputs.shape == expected_shape, f"Got {inputs.shape}"
-        assert targets.shape == expected_shape, f"Got {targets.shape}"
-        assert input_mask.shape == expected_shape, f"Got {input_mask.shape}"
-        return inputs, targets, input_mask
 
 
 def build_tokenizer(composer_groups: list[str] | None = None) -> ComposerREMI:
@@ -237,129 +234,108 @@ def as_token_sequences(tokens: TokSequence | list[TokSequence]) -> list[TokSeque
     return tokens if isinstance(tokens, list) else [tokens]
 
 
-def sequence_ids(tokenizer: REMI, sequence: TokSequence) -> list[int]:
-    tokenizer.complete_sequence(sequence)
-    ids = sequence.ids
-    if len(ids) == 0:
-        return []
-
-    assert all(isinstance(token_id, int) for token_id in ids), f"Got {type(ids[0])}"
-    return ids
-
-
-def chunk_ids(
-    ids: list[int],
-    max_seq_len: int,
-    pad_token_id: int,
-    stride: int,
-    prefix_token_id: int,
-) -> list[tuple[list[int], list[int]]]:
-    content_length = max_seq_len - 1
-    assert 0 < stride <= content_length, (
-        f"stride={stride} must be in range [1, {content_length}]"
-    )
-    chunks: list[tuple[list[int], list[int]]] = []
-
-    for start in range(0, len(ids), stride):
-        content = ids[start : start + content_length]
-        if len(content) == 0:
-            continue
-
-        chunk = [prefix_token_id, *content]
-        attention_mask = [1] * len(chunk)
-        pad_length = max_seq_len - len(chunk)
-        if pad_length > 0:
-            chunk = [*chunk, *([pad_token_id] * pad_length)]
-            attention_mask = [*attention_mask, *([0] * pad_length)]
-
-        assert len(chunk) == max_seq_len, f"Got {len(chunk)}"
-        assert len(attention_mask) == max_seq_len, f"Got {len(attention_mask)}"
-        chunks.append((chunk, attention_mask))
-
-    return chunks
-
-
-def tokenize_split(
+def collect_split_records(
     metadata: pd.DataFrame,
     split: str,
-    tokenizer: REMI,
-    composer_mapping: dict[str, str],
-    max_seq_len: int,
-    chunk_stride: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    all_input_ids: list[list[int]] = []
-    all_attention_masks: list[list[int]] = []
-    split_rows = metadata[metadata["split"].astype(str).str.lower() == split]
-    processed_files = 0
+) -> tuple[list[MidiRecord], int]:
+    records: list[MidiRecord] = []
     missing_files = 0
-
+    split_rows = metadata[metadata["split"].astype(str).str.lower() == split]
     for row in split_rows.itertuples(index=False):
-        record = MidiRecord(
-            midi_path=Path(row.midi_path),
-            composer=str(row.canonical_composer),
-            split=str(row.split),
-        )
-        midi_path = record.midi_path
+        midi_path = Path(row.midi_path)
         if not midi_path.exists():
             logger.warning("Skipping missing MIDI file: %s", midi_path)
             missing_files += 1
             continue
         if not validate_midi_file(midi_path):
             continue
+        records.append(
+            MidiRecord(
+                midi_path=midi_path,
+                composer=str(row.canonical_composer),
+                split=str(row.split),
+            )
+        )
+    return records, missing_files
 
+
+def chunk_base_ids(ids: list[int], max_seq_len: int, stride: int) -> list[list[int]]:
+    # One slot per chunk is reserved for the composer prefix added in train.py.
+    content_length = max_seq_len - 1
+    assert 0 < stride <= content_length, (
+        f"stride={stride} must be in range [1, {content_length}]"
+    )
+    chunks: list[list[int]] = []
+    for start in range(0, len(ids), stride):
+        content = ids[start : start + content_length]
+        if content:
+            chunks.append(content)
+    return chunks
+
+
+def tokenize_split(
+    records: list[MidiRecord],
+    tokenizer: ComposerREMI,
+    composer_mapping: dict[str, str],
+    max_seq_len: int,
+    chunk_stride: int,
+    shifts: tuple[int, ...],
+) -> list[dict[str, Any]]:
+    shift_maps = build_pitch_shift_maps(tokenizer)
+    docs: list[dict[str, Any]] = []
+    processed_files = 0
+
+    for record in records:
         composer_group = composer_mapping.get(record.composer, OTHER_COMPOSER)
-        prefix_token_id = tokenizer[composer_vocab_token(composer_group)]
+        composer_id = learned_token_id(
+            tokenizer, composer_vocab_token(composer_group)
+        )
         try:
-            tokens = tokenizer(midi_path)
+            tokens = tokenizer.encode(record.midi_path, encode_ids=False)
         except Exception as exc:
-            logger.warning("Skipping MIDI file %s: tokenization failed: %s", midi_path, exc)
+            logger.warning(
+                "Skipping MIDI file %s: tokenization failed: %s",
+                record.midi_path,
+                exc,
+            )
             continue
 
         for sequence in as_token_sequences(tokens):
-            ids = sequence_ids(tokenizer, sequence)
-            for chunk, attention_mask in chunk_ids(
-                ids,
-                max_seq_len,
-                tokenizer.pad_token_id,
-                chunk_stride,
-                prefix_token_id,
-            ):
-                all_input_ids.append(chunk)
-                all_attention_masks.append(attention_mask)
+            base_ids = list(sequence.ids)
+            if not base_ids:
+                continue
+            for chunk in chunk_base_ids(base_ids, max_seq_len, chunk_stride):
+                chunk_tensor = torch.tensor(chunk, dtype=torch.long)
+                shifted_batch = [
+                    shift_maps[shift][chunk_tensor].tolist() for shift in shifts
+                ]
+                encoded_batch = encode_base_ids_batch(tokenizer, shifted_batch)
+                variants = {
+                    shift: torch.tensor(encoded, dtype=torch.int32)
+                    for shift, encoded in zip(shifts, encoded_batch)
+                }
+                docs.append({"composer_id": composer_id, "variants": variants})
         processed_files += 1
 
-    if len(all_input_ids) == 0:
-        msg = f"No token sequences were created for split '{split}'."
-        raise ValueError(msg)
+    if not docs:
+        raise ValueError("No token sequences were created for this split")
 
-    input_ids = torch.tensor(all_input_ids, dtype=torch.long)
-    attention_mask = torch.tensor(all_attention_masks, dtype=torch.bool)
-
-    expected_shape = (len(all_input_ids), max_seq_len)
-    assert input_ids.shape == expected_shape, f"Got {input_ids.shape}"
-    assert attention_mask.shape == expected_shape, f"Got {attention_mask.shape}"
-
-    logger.info(
-        "Processed split=%s | files=%d | missing=%d | chunks=%d",
-        split,
-        processed_files,
-        missing_files,
-        len(all_input_ids),
-    )
-    return input_ids, attention_mask
+    logger.info("Tokenized %d files into %d documents", processed_files, len(docs))
+    return docs
 
 
-def save_tokenized_tensors(
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    tokenizer: REMI,
+def save_tokenized_docs(
+    docs: list[dict[str, Any]],
+    tokenizer: ComposerREMI,
+    shifts: tuple[int, ...],
     output_path: Path,
 ) -> None:
     torch.save(
         {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "pad_token_id": tokenizer.pad_token_id,
+            "format": DOCS_FORMAT,
+            "docs": docs,
+            "shifts": list(shifts),
+            "pad_token_id": learned_token_id(tokenizer, "PAD_None"),
             "vocab_size": len(tokenizer),
         },
         output_path,
@@ -384,46 +360,65 @@ def main() -> None:
         len(composer_groups),
     )
 
+    train_records, train_missing = collect_split_records(metadata, "train")
+    val_records, val_missing = collect_split_records(metadata, "validation")
+    logger.info(
+        "Valid MIDI files: train=%d (missing %d) | validation=%d (missing %d)",
+        len(train_records),
+        train_missing,
+        len(val_records),
+        val_missing,
+    )
+
     tokenizer = build_tokenizer(composer_groups)
+    logger.info(
+        "Training BPE: base vocab %d -> target %d on %d files",
+        len(tokenizer.vocab),
+        BPE_VOCAB_SIZE,
+        len(train_records),
+    )
+    tokenizer.train(
+        vocab_size=BPE_VOCAB_SIZE,
+        model="BPE",
+        files_paths=[record.midi_path for record in train_records],
+    )
+    assert tokenizer.is_trained, "BPE training did not mark the tokenizer trained"
+    # The learned BPE model is serialized inside the same params file, so a
+    # plain ComposerREMI(params=...) restores identical encodings.
     tokenizer.save(TOKENIZER_PATH)
     save_composer_mapping(composer_mapping, COMPOSER_MAPPING_PATH)
 
-    train_input_ids, train_attention_mask = tokenize_split(
-        metadata,
-        "train",
+    train_docs = tokenize_split(
+        train_records,
         tokenizer,
         composer_mapping,
         MAX_SEQ_LEN,
         CHUNK_STRIDE,
+        TRAIN_SHIFTS,
     )
-    val_input_ids, val_attention_mask = tokenize_split(
-        metadata,
-        "validation",
+    val_docs = tokenize_split(
+        val_records,
         tokenizer,
         composer_mapping,
         MAX_SEQ_LEN,
         CHUNK_STRIDE,
+        VAL_SHIFTS,
     )
 
-    save_tokenized_tensors(
-        train_input_ids,
-        train_attention_mask,
-        tokenizer,
-        TRAIN_TOKENS_PATH,
-    )
-    save_tokenized_tensors(
-        val_input_ids,
-        val_attention_mask,
-        tokenizer,
-        VAL_TOKENS_PATH,
-    )
+    save_tokenized_docs(train_docs, tokenizer, TRAIN_SHIFTS, TRAIN_TOKENS_PATH)
+    save_tokenized_docs(val_docs, tokenizer, VAL_SHIFTS, VAL_TOKENS_PATH)
+
+    encoded_lengths = sum(int(doc["variants"][0].numel()) for doc in train_docs)
     logger.info(
-        "Saved train=%d to %s | validation=%d to %s | tokenizer=%s",
-        len(train_input_ids),
+        "Saved train=%d docs to %s | validation=%d docs to %s | tokenizer=%s "
+        "| learned vocab=%d | train tokens after BPE=%d",
+        len(train_docs),
         TRAIN_TOKENS_PATH,
-        len(val_input_ids),
+        len(val_docs),
         VAL_TOKENS_PATH,
         TOKENIZER_PATH,
+        len(tokenizer),
+        encoded_lengths,
     )
 
 
