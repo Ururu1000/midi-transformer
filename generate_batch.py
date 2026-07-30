@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
- 
+
 from generate import generate, load_model, tokens_to_midi_file
 from model import get_device
 from scripts.tokenize_midi import ComposerREMI
@@ -25,63 +25,57 @@ class Preset:
     name: str
     composer: str
     temperature: float
-    top_k: int
-    top_p: float
-    repetition_penalty: float
+    min_p: float
+    cfg_scale: float
     length: int
     description: str
 
 
 PRESETS: list[Preset] = [
     Preset(
-        name="01_liszt",
+        name="01_chopin",
+        composer="Frédéric Chopin",
+        temperature=0.90,
+        min_p=0.05,
+        cfg_scale=2.0,
+        length=1024,
+        description="Chopin: default min-p + CFG 2.0",
+    ),
+    Preset(
+        name="02_bach",
+        composer="Johann Sebastian Bach",
+        temperature=0.80,
+        min_p=0.08,
+        cfg_scale=2.5,
+        length=1024,
+        description="Bach: conservative cutoff, strong CFG",
+    ),
+    Preset(
+        name="03_liszt",
         composer="Franz Liszt",
         temperature=1.05,
-        top_k=70,
-        top_p=0.97,
-        repetition_penalty=1.08,
-        length=512,
-        description="Liszt: virtuosic, high exploration",
+        min_p=0.03,
+        cfg_scale=1.5,
+        length=1024,
+        description="Liszt: hot sampling, wide tail, milder CFG",
     ),
     Preset(
-        name="02_debussy",
+        name="04_debussy",
         composer="Claude Debussy",
-        temperature=0.88,
-        top_k=50,
-        top_p=0.92,
-        repetition_penalty=1.14,
-        length=512,
-        description="Debussy: soft colors, medium free sampling",
+        temperature=0.95,
+        min_p=0.05,
+        cfg_scale=2.0,
+        length=1024,
+        description="Debussy: balanced min-p and CFG",
     ),
     Preset(
-        name="03_schubert",
-        composer="Franz Schubert",
-        temperature=0.92,
-        top_k=55,
-        top_p=0.94,
-        repetition_penalty=1.18,
-        length=512,
-        description="Schubert: lyrical, tighter anti-repeat",
-    ),
-    Preset(
-        name="04_scarlatti",
-        composer="Domenico Scarlatti",
-        temperature=0.85,
-        top_k=45,
-        top_p=0.90,
-        repetition_penalty=1.20,
-        length=512,
-        description="Scarlatti: crisp, focused baroque keyboard",
-    ),
-    Preset(
-        name="05_scriabin",
-        composer="Alexander Scriabin",
-        temperature=1.10,
-        top_k=75,
-        top_p=0.98,
-        repetition_penalty=1.06,
-        length=512,
-        description="Scriabin: dense harmony, wide nucleus",
+        name="05_rachmaninoff",
+        composer="Sergei Rachmaninoff",
+        temperature=1.00,
+        min_p=0.10,
+        cfg_scale=3.0,
+        length=1024,
+        description="Rachmaninoff: tight cutoff, strong CFG",
     ),
 ]
 
@@ -96,13 +90,12 @@ def main() -> None:
 
     for preset in PRESETS:
         logger.info(
-            "--- Preset: %s | composer=%s temp=%.2f top_k=%d top_p=%.2f length=%d ---",
+            "--- Preset: %s | composer=%s temp=%.2f min_p=%.2f cfg=%.1f ---",
             preset.name,
             preset.composer,
             preset.temperature,
-            preset.top_k,
-            preset.top_p,
-            preset.length,
+            preset.min_p,
+            preset.cfg_scale,
         )
         logger.info("    %s", preset.description)
 
@@ -112,17 +105,17 @@ def main() -> None:
             device,
             length=preset.length,
             temperature=preset.temperature,
-            top_k=preset.top_k,
             composer=preset.composer,
-            top_p=preset.top_p,
-            repetition_penalty=preset.repetition_penalty,
+            min_p=preset.min_p,
+            cfg_scale=preset.cfg_scale,
         )
 
         out_path = OUTPUT_DIR / f"{preset.name}.mid"
         tokens_to_midi_file(tokenizer, token_ids, out_path)
+        logger.info("Saved %s (%d tokens)", out_path, len(token_ids))
 
     logger.info("Done. Files saved to %s/", OUTPUT_DIR)
-    for path in sorted(OUTPUT_DIR.glob("*.mid")):
+    for path in sorted(OUTPUT_DIR.glob("0*.mid")):
         logger.info("  %s  (%d bytes)", path.name, path.stat().st_size)
 
 

@@ -82,6 +82,24 @@ class KVCache(NamedTuple):
     value: Tensor
 
 
+def build_document_causal_mask(doc_ids: Tensor) -> Tensor:
+    """Block-diagonal causal mask for packed sequences.
+
+    ``doc_ids`` holds one document index per position; padding uses its own
+    sentinel id. A position may only attend to earlier positions of the same
+    document, so packed rows never leak attention across document boundaries.
+    """
+    assert doc_ids.ndim == 2, f"Got {doc_ids.shape}"
+    batch_size, seq_len = doc_ids.shape
+    same_document = doc_ids.unsqueeze(1) == doc_ids.unsqueeze(2)
+    causal = torch.ones(
+        seq_len, seq_len, dtype=torch.bool, device=doc_ids.device
+    ).tril()
+    mask = (same_document & causal).unsqueeze(1)
+    assert mask.shape == (batch_size, 1, seq_len, seq_len), f"Got {mask.shape}"
+    return mask
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(
         self,
@@ -109,6 +127,7 @@ class CausalSelfAttention(nn.Module):
         past_key_value: KVCache | None = None,
         start_pos: int = 0,
         use_cache: bool = False,
+        attn_mask: Tensor | None = None,
     ) -> tuple[Tensor, KVCache | None]:
         batch_size, seq_len, d_model = x.shape
         assert d_model == self.d_model, f"Got {x.shape}"
@@ -131,12 +150,19 @@ class CausalSelfAttention(nn.Module):
 
         query_len = q.shape[2]
         key_len = k.shape[2]
-        # is_causal aligns the mask to the top-left corner, which is only correct
-        # when queries cover the whole key sequence. With a cache the queries are
-        # the tail of the keys, so the mask must be offset by the cached length.
-        attn_mask: Tensor | None = None
-        is_causal = query_len == key_len
-        if not is_causal:
+        is_causal = attn_mask is None and query_len == key_len
+        if attn_mask is not None:
+            # Precomputed block-diagonal causal mask for packed training rows;
+            # incompatible with an incremental KV cache by construction.
+            assert past_key_value is None and not use_cache
+            assert attn_mask.shape == (batch_size, 1, query_len, key_len), (
+                f"Got {attn_mask.shape}"
+            )
+        elif not is_causal:
+            # is_causal aligns the mask to the top-left corner, which is only
+            # correct when queries cover the whole key sequence. With a cache the
+            # queries are the tail of the keys, so the mask is offset by the
+            # cached length.
             attn_mask = torch.ones(
                 query_len, key_len, dtype=torch.bool, device=q.device
             ).tril(diagonal=key_len - query_len)
@@ -175,6 +201,7 @@ class TransformerBlock(nn.Module):
         past_key_value: KVCache | None = None,
         start_pos: int = 0,
         use_cache: bool = False,
+        attn_mask: Tensor | None = None,
     ) -> tuple[Tensor, KVCache | None]:
         normed = self.norm1(x)
         attn_out, next_cache = self.attn(
@@ -182,6 +209,7 @@ class TransformerBlock(nn.Module):
             past_key_value=past_key_value,
             start_pos=start_pos,
             use_cache=use_cache,
+            attn_mask=attn_mask,
         )
         x = x + attn_out
         x = x + self.mlp(self.norm2(x))
@@ -234,8 +262,17 @@ class MusicTransformer(nn.Module):
         input_ids: Tensor,
         past_key_values: list[KVCache | None] | None = None,
         use_cache: bool = False,
+        doc_ids: Tensor | None = None,
     ) -> tuple[Tensor, list[KVCache | None] | None]:
         batch_size, seq_len = input_ids.shape
+        attn_mask: Tensor | None = None
+        if doc_ids is not None:
+            assert past_key_values is None and not use_cache, (
+                "doc_ids masking is a training-only path"
+            )
+            assert doc_ids.shape == input_ids.shape, f"Got {doc_ids.shape}"
+            attn_mask = build_document_causal_mask(doc_ids)
+
         start_pos = 0
         if past_key_values is not None:
             assert len(past_key_values) == self.num_layers, (
@@ -260,6 +297,7 @@ class MusicTransformer(nn.Module):
                 past_key_value=layer_cache,
                 start_pos=start_pos,
                 use_cache=use_cache,
+                attn_mask=attn_mask,
             )
             if use_cache:
                 next_caches.append(cache)
@@ -297,3 +335,9 @@ if __name__ == "__main__":
     logger.info("Input shape: %s", tuple(fake_input.shape))
     logger.info("Output shape: %s", tuple(logits.shape))
     assert logits.shape == (2, seq_len, vocab_size), f"Got {logits.shape}"
+
+    doc_ids = torch.zeros((2, seq_len), dtype=torch.long, device=device)
+    doc_ids[:, seq_len // 2 :] = 1
+    packed_logits, _ = model(fake_input, doc_ids=doc_ids)
+    assert packed_logits.shape == (2, seq_len, vocab_size), f"Got {packed_logits.shape}"
+    logger.info("Packed forward with block-diagonal mask OK")

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from collections import Counter, deque
 from pathlib import Path
 
 import torch
@@ -14,6 +13,7 @@ from scripts.tokenize_midi import (
     UNCONDITIONAL_COMPOSER,
     ComposerREMI,
     composer_vocab_token,
+    learned_token_id,
 )
 
 CHECKPOINT_PATH = Path("checkpoints/model_best.pt")
@@ -22,59 +22,49 @@ OUTPUT_PATH = Path("data/processed/output.mid")
 
 COMPOSER = "Frédéric Chopin"
 GENERATION_LENGTH = 1024
-TEMPERATURE = 0.8
-# Nucleus sampling only; top-k truncation is disabled by default.
-TOP_K = 0
-TOP_P = 0.9
-CFG_SCALE = 1.2
-REPETITION_PENALTY = 1.02
-# Rest/TimeShift loops are the "silent bar" failure mode, so they are penalized
-# harder than pitches and the penalty escalates with each recent occurrence.
-TIME_REPETITION_PENALTY = 1.0
-MAX_TIME_PENALTY_EXPONENT = 4.0
-REPETITION_WINDOW = 80
-STUCK_LOOKBACK = 64
-NGRAM_MIN_LEN = 4
-NGRAM_MAX_LEN = 8
-TEMPERATURE_BOOST = 0.2
+TEMPERATURE = 0.9
+# Min-P keeps every token whose probability is at least MIN_P times the top
+# token's probability. The cutoff scales with model confidence, which trims the
+# long tail without the fixed-mass distortion of nucleus sampling.
+MIN_P = 0.05
+CFG_SCALE = 2.0
 # The training chunks never contained EOS, so its logit is unreliable early on.
 MIN_NEW_TOKENS = 64
 
-TIME_PREFIXES = ("TimeShift", "Rest")
+FORBIDDEN_PREFIXES = ("PAD", "BOS", "MASK", "Composer")
 
 logger = logging.getLogger(__name__)
 
 
+def iter_vocab_entries(tokenizer: REMI) -> list[tuple[int, list[str]]]:
+    """(model id, constituent base tokens) for every id the model can emit.
+
+    With a trained BPE model one id may decompose into several base tokens;
+    without one every id maps to exactly one base token.
+    """
+    if tokenizer.is_trained:
+        bytes_to_tokens = tokenizer._vocab_learned_bytes_to_tokens
+        return [
+            (int(token_id), list(bytes_to_tokens[byte_form]))
+            for byte_form, token_id in tokenizer.vocab_model.items()
+        ]
+    return [(int(token_id), [token]) for token, token_id in tokenizer.vocab.items()]
+
+
 class TokenCategories:
     def __init__(self, tokenizer: REMI, device: torch.device) -> None:
-        pitch: list[int] = []
-        structural: list[int] = []
-        time_shift: list[int] = []
         forbidden: list[int] = []
-        for token, token_id in tokenizer.vocab.items():
-            prefix = token.split("_")[0]
-            if prefix in ("Pitch", "PitchDrum"):
-                pitch.append(token_id)
-            elif prefix in ("Bar", "Position"):
-                structural.append(token_id)
-            elif prefix in TIME_PREFIXES:
-                time_shift.append(token_id)
-            elif prefix in ("PAD", "BOS", "MASK", "Composer"):
+        for token_id, base_tokens in iter_vocab_entries(tokenizer):
+            prefixes = {token.split("_")[0] for token in base_tokens}
+            if prefixes & set(FORBIDDEN_PREFIXES):
                 forbidden.append(token_id)
 
-        vocab_size = len(tokenizer)
-        self.eos_token_id = int(tokenizer.vocab["EOS_None"])
-        self.pitch_ids = torch.tensor(pitch, dtype=torch.long, device=device)
-        self.structural_ids = torch.tensor(structural, dtype=torch.long, device=device)
-        self.time_ids = torch.tensor(time_shift, dtype=torch.long, device=device)
-        self.forbidden_ids = torch.tensor(forbidden, dtype=torch.long, device=device)
-
-        self.is_pitch = torch.zeros(vocab_size, dtype=torch.bool, device=device)
-        self.is_pitch[self.pitch_ids] = True
-        self.is_structural = torch.zeros(vocab_size, dtype=torch.bool, device=device)
-        self.is_structural[self.structural_ids] = True
-        self.is_time = torch.zeros(vocab_size, dtype=torch.bool, device=device)
-        self.is_time[self.time_ids] = True
+        self.eos_token_id = learned_token_id(tokenizer, "EOS_None")
+        self.forbidden_ids = torch.tensor(
+            sorted(set(forbidden) - {self.eos_token_id}),
+            dtype=torch.long,
+            device=device,
+        )
 
 
 def load_model(checkpoint_path: Path, device: torch.device) -> MusicTransformer:
@@ -122,7 +112,7 @@ def resolve_composer_token(tokenizer: REMI, composer: str) -> str:
 
 def pick_start_token(tokenizer: REMI, composer: str) -> int:
     token = resolve_composer_token(tokenizer, composer)
-    start_token = tokenizer[token]
+    start_token = learned_token_id(tokenizer, token)
     logger.info("Using composer seed %s (id=%d)", token, start_token)
     return start_token
 
@@ -131,74 +121,18 @@ def pick_unconditional_token(tokenizer: REMI) -> int | None:
     token = composer_vocab_token(UNCONDITIONAL_COMPOSER)
     if token not in tokenizer.vocab:
         return None
-    return int(tokenizer.vocab[token])
+    return learned_token_id(tokenizer, token)
 
 
-def apply_repetition_penalty(
-    logits: Tensor,
-    window: deque[int],
-    categories: TokenCategories,
-    pitch_penalty: float,
-    time_penalty: float,
-) -> None:
-    if not window:
-        return
+def min_p_filter(logits: Tensor, min_p: float) -> Tensor:
+    assert logits.ndim == 1, f"Got {logits.shape}"
+    if min_p <= 0.0:
+        return logits
 
-    counts = Counter(window)
-    recent_ids = torch.tensor(sorted(counts), dtype=torch.long, device=logits.device)
-    occurrences = torch.tensor(
-        [float(counts[int(token_id)]) for token_id in recent_ids],
-        device=logits.device,
-    )
-
-    divisor = torch.ones_like(occurrences)
-    if pitch_penalty > 1.0:
-        divisor[categories.is_pitch[recent_ids]] = pitch_penalty
-    if time_penalty > 1.0:
-        is_time = categories.is_time[recent_ids]
-        exponent = occurrences[is_time].clamp(max=MAX_TIME_PENALTY_EXPONENT)
-        divisor[is_time] = time_penalty**exponent
-
-    scores = logits[recent_ids]
-    logits[recent_ids] = torch.where(
-        scores > 0, scores / divisor, scores * divisor
-    )
-
-
-def top_k_top_p_filter(logits: Tensor, top_k: int, top_p: float) -> Tensor:
-    filtered = logits.clone()
-
-    if top_k > 0:
-        top_k = min(top_k, filtered.shape[-1])
-        kth_value = torch.topk(filtered, top_k).values[-1]
-        filtered[filtered < kth_value] = float("-inf")
-
-    if 0.0 < top_p < 1.0:
-        sorted_logits, sorted_indices = torch.sort(filtered, descending=True)
-        cumulative_probs = F.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
-        remove_sorted = cumulative_probs > top_p
-        remove_sorted[1:] = remove_sorted[:-1].clone()
-        remove_sorted[0] = False
-        remove_indices = sorted_indices[remove_sorted]
-        filtered[remove_indices] = float("-inf")
-
-    return filtered
-
-
-def is_stuck(window: deque[int]) -> bool:
-    """Detect repeating n-grams (length 4-8) in the recent token window."""
-    if len(window) < NGRAM_MIN_LEN * 2:
-        return False
-
-    tokens = list(window)
-    for ngram_len in range(NGRAM_MIN_LEN, NGRAM_MAX_LEN + 1):
-        if len(tokens) < ngram_len * 2:
-            continue
-        tail = tokens[-ngram_len:]
-        prev = tokens[-(ngram_len * 2) : -ngram_len]
-        if tail == prev:
-            return True
-    return False
+    probs = F.softmax(logits, dim=-1)
+    threshold = min_p * probs.max()
+    # The argmax always survives, so the filtered distribution is never empty.
+    return logits.masked_fill(probs < threshold, float("-inf"))
 
 
 @torch.no_grad()
@@ -208,14 +142,13 @@ def generate(
     device: torch.device,
     length: int,
     temperature: float = TEMPERATURE,
-    top_k: int = TOP_K,
     composer: str = COMPOSER,
-    top_p: float = TOP_P,
-    repetition_penalty: float = REPETITION_PENALTY,
-    repetition_window: int = REPETITION_WINDOW,
-    time_repetition_penalty: float = TIME_REPETITION_PENALTY,
+    min_p: float = MIN_P,
     cfg_scale: float = CFG_SCALE,
 ) -> list[int]:
+    assert temperature > 0.0, f"Got temperature={temperature}"
+    assert 0.0 <= min_p < 1.0, f"Got min_p={min_p}"
+
     categories = TokenCategories(tokenizer, device)
     start_token = pick_start_token(tokenizer, composer)
 
@@ -250,9 +183,6 @@ def generate(
             uncond_token,
         )
 
-    penalty_window: deque[int] = deque([start_token], maxlen=repetition_window)
-    stuck_window: deque[int] = deque([start_token], maxlen=STUCK_LOOKBACK)
-
     past_key_values: list[KVCache | None] | None = None
     log_every = max(max_tokens // 10, 1)
     total_tokens = max_tokens
@@ -280,25 +210,9 @@ def generate(
         next_logits[categories.forbidden_ids] = float("-inf")
         if step < MIN_NEW_TOKENS:
             next_logits[categories.eos_token_id] = float("-inf")
-        apply_repetition_penalty(
-            next_logits,
-            penalty_window,
-            categories,
-            repetition_penalty,
-            time_repetition_penalty,
-        )
 
-        effective_temperature = temperature
-        if is_stuck(stuck_window):
-            effective_temperature += TEMPERATURE_BOOST
-        next_logits = next_logits / effective_temperature
-
-        structural_scores = next_logits[categories.structural_ids].clone()
-        filtered = top_k_top_p_filter(next_logits, top_k, top_p)
-        if torch.isinf(filtered).all():
-            filtered[categories.structural_ids] = structural_scores
-
-        probs = F.softmax(filtered, dim=-1)
+        next_logits = min_p_filter(next_logits / temperature, min_p)
+        probs = F.softmax(next_logits, dim=-1)
         next_token = int(torch.multinomial(probs, num_samples=1).item())
 
         if next_token == categories.eos_token_id:
@@ -307,8 +221,6 @@ def generate(
             break
 
         generated[:, step] = next_token
-        penalty_window.append(next_token)
-        stuck_window.append(next_token)
         step += 1
 
         if step % log_every == 0 or step == max_tokens:
@@ -326,11 +238,17 @@ def tokens_to_midi_file(
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     composer_ids = {
-        tokenizer[token] for token in list_composer_tokens(tokenizer)
+        learned_token_id(tokenizer, token)
+        for token in list_composer_tokens(tokenizer)
     }
-    decode_ids = [token_id for token_id in token_ids if token_id not in composer_ids]
-    sequence = TokSequence(ids=decode_ids)
-    score = tokenizer.tokens_to_midi([sequence])
+    eos_id = learned_token_id(tokenizer, "EOS_None")
+    decode_ids = [
+        token_id
+        for token_id in token_ids
+        if token_id not in composer_ids and token_id != eos_id
+    ]
+    sequence = TokSequence(ids=decode_ids, are_ids_encoded=tokenizer.is_trained)
+    score = tokenizer.decode([sequence])
     score.dump_midi(output_path)
     logger.info("Saved generated MIDI to %s", output_path)
 
@@ -345,7 +263,12 @@ def main() -> None:
     logger.info("Device: %s", device)
 
     tokenizer = ComposerREMI(params=str(TOKENIZER_PATH))
-    logger.info("Loaded tokenizer from %s | vocab_size=%d", TOKENIZER_PATH, len(tokenizer))
+    logger.info(
+        "Loaded tokenizer from %s | vocab_size=%d | bpe=%s",
+        TOKENIZER_PATH,
+        len(tokenizer),
+        tokenizer.is_trained,
+    )
 
     model = load_model(CHECKPOINT_PATH, device)
     if model.vocab_size != len(tokenizer):
@@ -361,10 +284,9 @@ def main() -> None:
         tokenizer,
         device,
         GENERATION_LENGTH,
-        TEMPERATURE,
-        TOP_K,
+        temperature=TEMPERATURE,
         composer=COMPOSER,
-        top_p=TOP_P,
+        min_p=MIN_P,
         cfg_scale=CFG_SCALE,
     )
     logger.info("Generated %d tokens", len(token_ids))
