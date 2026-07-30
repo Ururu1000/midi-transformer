@@ -29,6 +29,10 @@ PITCH_RANGE = (21, 109)
 NUM_VELOCITIES = 32
 TOP_COMPOSERS = 15
 OTHER_COMPOSER = "OTHER"
+# Conditioning token dropped in during training so the model also learns the
+# unconditional distribution required by classifier-free guidance at inference.
+UNCONDITIONAL_COMPOSER = "UNCONDITIONAL"
+RESERVED_COMPOSERS = (OTHER_COMPOSER, UNCONDITIONAL_COMPOSER)
 # 12 positions per beat -> triplet / rubato-friendly 1/12 quantization.
 POSITIONS_PER_BEAT = 12
 
@@ -90,11 +94,24 @@ def load_metadata(metadata_path: Path, dataset_dir: Path) -> pd.DataFrame:
 
 def build_composer_mapping(metadata: pd.DataFrame) -> dict[str, str]:
     counts = metadata["canonical_composer"].astype(str).value_counts()
-    top_composers = set(counts.head(TOP_COMPOSERS).index)
+    reserved = {composer_vocab_token(name) for name in RESERVED_COMPOSERS}
+    top_composers = {
+        composer
+        for composer in counts.head(TOP_COMPOSERS).index
+        if composer_vocab_token(str(composer)) not in reserved
+    }
     return {
         composer: composer if composer in top_composers else OTHER_COMPOSER
         for composer in counts.index
     }
+
+
+def build_composer_groups(mapping: dict[str, str]) -> list[str]:
+    groups = [
+        composer for composer, group in mapping.items() if group != OTHER_COMPOSER
+    ]
+    groups.extend(RESERVED_COMPOSERS)
+    return groups
 
 
 def save_composer_mapping(mapping: dict[str, str], output_path: Path) -> None:
@@ -103,6 +120,7 @@ def save_composer_mapping(mapping: dict[str, str], output_path: Path) -> None:
             composer for composer, group in mapping.items() if group != OTHER_COMPOSER
         ],
         "other_token": composer_vocab_token(OTHER_COMPOSER),
+        "unconditional_token": composer_vocab_token(UNCONDITIONAL_COMPOSER),
         "composer_to_group": mapping,
     }
     output_path.write_text(
@@ -357,12 +375,7 @@ def main() -> None:
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     metadata = load_metadata(METADATA_PATH, DATASET_DIR)
     composer_mapping = build_composer_mapping(metadata)
-    composer_groups = [
-        composer
-        for composer, group in composer_mapping.items()
-        if group != OTHER_COMPOSER
-    ]
-    composer_groups.append(OTHER_COMPOSER)
+    composer_groups = build_composer_groups(composer_mapping)
 
     logger.info(
         "Loaded %d metadata rows | composers=%d | conditioned groups=%d",
