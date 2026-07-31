@@ -133,11 +133,24 @@ def capture_rng_state() -> dict[str, Any]:
     return state
 
 
+def _as_cpu_byte_tensor(state: Any) -> Tensor:
+    # torch.load(..., map_location="cuda") remaps nested RNG tensors onto the
+    # GPU; both the CPU and CUDA generators only accept CPU ByteTensors.
+    if not isinstance(state, torch.Tensor):
+        raise TypeError(f"Expected RNG Tensor, got {type(state)}")
+    return state.detach().to(device="cpu", dtype=torch.uint8).contiguous()
+
+
 def restore_rng_state(rng_state: dict[str, Any]) -> None:
     random.setstate(rng_state["python"])
-    torch.set_rng_state(rng_state["torch"])
+    torch.set_rng_state(_as_cpu_byte_tensor(rng_state["torch"]))
     if torch.cuda.is_available() and rng_state.get("cuda") is not None:
-        torch.cuda.set_rng_state_all(rng_state["cuda"])
+        cuda_states = rng_state["cuda"]
+        if isinstance(cuda_states, torch.Tensor):
+            cuda_states = [cuda_states]
+        torch.cuda.set_rng_state_all(
+            [_as_cpu_byte_tensor(state) for state in cuda_states]
+        )
 
 
 @dataclass(frozen=True)

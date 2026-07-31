@@ -27,6 +27,7 @@ class Preset:
     temperature: float
     min_p: float
     cfg_scale: float
+    repetition_penalty: float
     length: int
     description: str
 
@@ -35,47 +36,52 @@ PRESETS: list[Preset] = [
     Preset(
         name="01_chopin",
         composer="Frédéric Chopin",
-        temperature=0.90,
-        min_p=0.05,
-        cfg_scale=2.0,
-        length=1024,
-        description="Chopin: default min-p + CFG 2.0",
+        temperature=0.70,
+        min_p=0.08,
+        cfg_scale=1.0,
+        repetition_penalty=1.20,
+        length=1536,
+        description="Chopin: baseline, CFG off, repetition penalty 1.2",
     ),
     Preset(
         name="02_bach",
         composer="Johann Sebastian Bach",
-        temperature=0.80,
-        min_p=0.08,
-        cfg_scale=2.5,
-        length=1024,
-        description="Bach: conservative cutoff, strong CFG",
+        temperature=0.70,
+        min_p=0.10,
+        cfg_scale=1.0,
+        repetition_penalty=1.30,
+        length=1536,
+        description="Bach: tighter cutoff, harder anti-loop penalty",
     ),
     Preset(
         name="03_liszt",
         composer="Franz Liszt",
-        temperature=1.05,
-        min_p=0.03,
-        cfg_scale=1.5,
-        length=1024,
-        description="Liszt: hot sampling, wide tail, milder CFG",
+        temperature=0.85,
+        min_p=0.06,
+        cfg_scale=1.0,
+        repetition_penalty=1.15,
+        length=1536,
+        description="Liszt: hotter sampling, lighter penalty",
     ),
     Preset(
         name="04_debussy",
         composer="Claude Debussy",
-        temperature=0.95,
-        min_p=0.05,
-        cfg_scale=2.0,
-        length=1024,
-        description="Debussy: balanced min-p and CFG",
+        temperature=0.75,
+        min_p=0.08,
+        cfg_scale=1.0,
+        repetition_penalty=1.20,
+        length=1536,
+        description="Debussy: balanced cool sampling",
     ),
     Preset(
         name="05_rachmaninoff",
         composer="Sergei Rachmaninoff",
-        temperature=1.00,
+        temperature=0.75,
         min_p=0.10,
-        cfg_scale=3.0,
-        length=1024,
-        description="Rachmaninoff: tight cutoff, strong CFG",
+        cfg_scale=1.2,
+        repetition_penalty=1.25,
+        length=1536,
+        description="Rachmaninoff: slight CFG, strong penalty",
     ),
 ]
 
@@ -90,12 +96,13 @@ def main() -> None:
 
     for preset in PRESETS:
         logger.info(
-            "--- Preset: %s | composer=%s temp=%.2f min_p=%.2f cfg=%.1f ---",
+            "--- Preset: %s | composer=%s temp=%.2f min_p=%.2f cfg=%.1f rep=%.2f ---",
             preset.name,
             preset.composer,
             preset.temperature,
             preset.min_p,
             preset.cfg_scale,
+            preset.repetition_penalty,
         )
         logger.info("    %s", preset.description)
 
@@ -108,6 +115,7 @@ def main() -> None:
             composer=preset.composer,
             min_p=preset.min_p,
             cfg_scale=preset.cfg_scale,
+            repetition_penalty=preset.repetition_penalty,
         )
 
         out_path = OUTPUT_DIR / f"{preset.name}.mid"
