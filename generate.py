@@ -21,15 +21,22 @@ TOKENIZER_PATH = Path("data/processed/tokenizer.json")
 OUTPUT_PATH = Path("data/processed/output.mid")
 
 COMPOSER = "Frédéric Chopin"
-GENERATION_LENGTH = 1024
-TEMPERATURE = 0.9
+# BPE packs more music per token than raw REMI, so 1536 is a solid piece length.
+GENERATION_LENGTH = 1536
+TEMPERATURE = 0.7
 # Min-P keeps every token whose probability is at least MIN_P times the top
 # token's probability. The cutoff scales with model confidence, which trims the
 # long tail without the fixed-mass distortion of nucleus sampling.
-MIN_P = 0.05
-CFG_SCALE = 2.0
+MIN_P = 0.08
+# CFG amplifies the gap between the conditional and unconditional logits, which
+# distorts the distribution of a model that is not yet strongly fit. 1.0 = off.
+CFG_SCALE = 1.0
+REPETITION_PENALTY = 1.2
 # The training chunks never contained EOS, so its logit is unreliable early on.
-MIN_NEW_TOKENS = 64
+MIN_NEW_TOKENS = 96
+# Recomputing the full prefix every step is O(L^2) but keeps the sampling loop
+# free of any cache-state assumptions. Set True to use the incremental KV cache.
+USE_KV_CACHE = False
 
 FORBIDDEN_PREFIXES = ("PAD", "BOS", "MASK", "Composer")
 
@@ -135,6 +142,26 @@ def min_p_filter(logits: Tensor, min_p: float) -> Tensor:
     return logits.masked_fill(probs < threshold, float("-inf"))
 
 
+def apply_repetition_penalty(
+    logits: Tensor,
+    history: Tensor,
+    penalty: float,
+) -> Tensor:
+    """Divide already-seen positive logits, multiply negative ones.
+
+    Scaling instead of subtracting keeps the penalty proportional to how much
+    the model wants a token, so confident-but-repeated ids fall furthest.
+    """
+    assert logits.ndim == 1, f"Got {logits.shape}"
+    if penalty == 1.0 or history.numel() == 0:
+        return logits
+
+    seen = torch.unique(history)
+    scores = logits[seen]
+    logits[seen] = torch.where(scores > 0, scores / penalty, scores * penalty)
+    return logits
+
+
 @torch.no_grad()
 def generate(
     model: MusicTransformer,
@@ -145,9 +172,11 @@ def generate(
     composer: str = COMPOSER,
     min_p: float = MIN_P,
     cfg_scale: float = CFG_SCALE,
+    repetition_penalty: float = REPETITION_PENALTY,
 ) -> list[int]:
     assert temperature > 0.0, f"Got temperature={temperature}"
     assert 0.0 <= min_p < 1.0, f"Got min_p={min_p}"
+    assert repetition_penalty >= 1.0, f"Got repetition_penalty={repetition_penalty}"
 
     categories = TokenCategories(tokenizer, device)
     start_token = pick_start_token(tokenizer, composer)
@@ -189,15 +218,19 @@ def generate(
 
     step = 1
     while step < max_tokens:
-        # The cache is never trimmed: the first pass consumes the whole prefix and
-        # every later pass feeds exactly one new token on top of the kept cache.
-        context = generated[:, :step] if past_key_values is None else generated[:, step - 1 : step]
-
-        logits, past_key_values = model(
-            context,
-            past_key_values=past_key_values,
-            use_cache=True,
-        )
+        if USE_KV_CACHE:
+            context = (
+                generated[:, :step]
+                if past_key_values is None
+                else generated[:, step - 1 : step]
+            )
+            logits, past_key_values = model(
+                context,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+        else:
+            logits, _ = model(generated[:, :step])
 
         if use_cfg:
             conditional = logits[0, -1, :].float()
@@ -211,20 +244,34 @@ def generate(
         if step < MIN_NEW_TOKENS:
             next_logits[categories.eos_token_id] = float("-inf")
 
+        next_logits = apply_repetition_penalty(
+            next_logits,
+            generated[0, :step],
+            repetition_penalty,
+        )
         next_logits = min_p_filter(next_logits / temperature, min_p)
         probs = F.softmax(next_logits, dim=-1)
-        next_token = int(torch.multinomial(probs, num_samples=1).item())
-
-        if next_token == categories.eos_token_id:
-            logger.info("EOS sampled at step %d, stopping", step)
-            total_tokens = step
-            break
+        # Kept on device: writing the sample straight into `generated` avoids a
+        # host synchronization on every step of the loop.
+        next_token = torch.multinomial(probs, num_samples=1)
 
         generated[:, step] = next_token
         step += 1
 
+        # EOS and progress both need host-side values, so they are the only
+        # places that synchronize, and only once EOS is actually reachable.
+        if step > MIN_NEW_TOKENS and bool(next_token.eq(categories.eos_token_id)):
+            logger.info("EOS sampled at step %d, stopping", step - 1)
+            total_tokens = step - 1
+            break
+
         if step % log_every == 0 or step == max_tokens:
-            logger.info("Generated %d/%d tokens (id=%d)", step, max_tokens, next_token)
+            logger.info(
+                "Generated %d/%d tokens (id=%d)",
+                step,
+                max_tokens,
+                int(next_token.item()),
+            )
 
     result = generated[0, :total_tokens].tolist()
     assert len(result) == total_tokens, f"Got {len(result)}"
@@ -288,6 +335,7 @@ def main() -> None:
         composer=COMPOSER,
         min_p=MIN_P,
         cfg_scale=CFG_SCALE,
+        repetition_penalty=REPETITION_PENALTY,
     )
     logger.info("Generated %d tokens", len(token_ids))
 
