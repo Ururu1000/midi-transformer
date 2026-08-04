@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -15,14 +16,17 @@ from miditok import REMI, TokSequence, TokenizerConfig
 from torch import Tensor
 
 MAX_SEQ_LEN = 4096
-CHUNK_STRIDE = 2048
+# Non-overlapping chunks: with GiantMIDI, 50% overlap mostly aids memorization.
+CHUNK_STRIDE = MAX_SEQ_LEN - 1
 DATASET_DIR = Path("data/raw_midi")
 METADATA_PATH = DATASET_DIR / "maestro-v3.0.0.csv"
+GIANTMIDI_DIR = DATASET_DIR / "giantmidi"
 PROCESSED_DIR = Path("data/processed")
 TOKENIZER_PATH = PROCESSED_DIR / "tokenizer.json"
 COMPOSER_MAPPING_PATH = PROCESSED_DIR / "composer_mapping.json"
 TRAIN_TOKENS_PATH = PROCESSED_DIR / "tokens_train.pt"
 VAL_TOKENS_PATH = PROCESSED_DIR / "tokens_val.pt"
+UNIFIED_METADATA_PATH = PROCESSED_DIR / "unified_metadata.csv"
 
 PITCH_RANGE = (21, 109)
 NUM_VELOCITIES = 32
@@ -48,6 +52,55 @@ TRAIN_SHIFTS = tuple(range(MIN_PITCH_SHIFT, MAX_PITCH_SHIFT + 1))
 VAL_SHIFTS = (0,)
 
 DOCS_FORMAT = "docs_v2_bpe"
+
+# GiantMIDI transcription quality gates. Cap is soft enough for Romantic
+# piano (pedal sustains) but still drops extreme transcription artifacts.
+MAX_POLYPHONY = 16
+MIN_NOTES_PER_SEC = 0.5
+MAX_NOTES_PER_SEC = 30.0
+GIANTMIDI_VAL_FRACTION = 0.05
+
+# Map GiantMIDI "Last, First" (and common variants) onto MAESTRO canonical names
+# so CFG composer tokens stay shared across sources.
+GIANTMIDI_COMPOSER_ALIASES: dict[str, str] = {
+    "Chopin, Frédéric": "Frédéric Chopin",
+    "Chopin, Frederic": "Frédéric Chopin",
+    "Bach, Johann Sebastian": "Johann Sebastian Bach",
+    "Beethoven, Ludwig van": "Ludwig van Beethoven",
+    "Liszt, Franz": "Franz Liszt",
+    "Debussy, Claude": "Claude Debussy",
+    "Rachmaninoff, Sergei": "Sergei Rachmaninoff",
+    "Rachmaninov, Sergei": "Sergei Rachmaninoff",
+    "Mozart, Wolfgang Amadeus": "Wolfgang Amadeus Mozart",
+    "Schubert, Franz": "Franz Schubert",
+    "Schumann, Robert": "Robert Schumann",
+    "Brahms, Johannes": "Johannes Brahms",
+    "Haydn, Joseph": "Joseph Haydn",
+    "Haydn, Franz Joseph": "Joseph Haydn",
+    "Scriabin, Alexander": "Alexander Scriabin",
+    "Scarlatti, Domenico": "Domenico Scarlatti",
+    "Mendelssohn, Felix": "Felix Mendelssohn",
+    "Tchaikovsky, Pyotr Ilyich": "Pyotr Ilyich Tchaikovsky",
+    "Tchaikovsky, Pyotr": "Pyotr Ilyich Tchaikovsky",
+    "Handel, George Frideric": "George Frideric Handel",
+    "Handel, Georg Friedrich": "George Frideric Handel",
+    "Grieg, Edvard": "Edvard Grieg",
+    "Franck, César": "César Franck",
+    "Franck, Cesar": "César Franck",
+    "Albéniz, Isaac": "Isaac Albéniz",
+    "Albeniz, Isaac": "Isaac Albéniz",
+    "Mussorgsky, Modest": "Modest Mussorgsky",
+    "Clementi, Muzio": "Muzio Clementi",
+    "Weber, Carl Maria von": "Carl Maria von Weber",
+    "Berg, Alban": "Alban Berg",
+    "Rameau, Jean-Philippe": "Jean-Philippe Rameau",
+    "Purcell, Henry": "Henry Purcell",
+    "Pachelbel, Johann": "Johann Pachelbel",
+    "Janáček, Leoš": "Leoš Janáček",
+    "Janacek, Leos": "Leoš Janáček",
+    "Enescu, George": "George Enescu",
+    "Soler, Antonio": "Antonio Soler",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +136,7 @@ class ComposerREMI(REMI):
         return [*composer_tokens, *vocabulary]
 
 
-def load_metadata(metadata_path: Path, dataset_dir: Path) -> pd.DataFrame:
+def load_maestro_metadata(metadata_path: Path, dataset_dir: Path) -> pd.DataFrame:
     if not metadata_path.exists():
         raise FileNotFoundError(f"MAESTRO metadata not found: {metadata_path}")
 
@@ -98,6 +151,105 @@ def load_metadata(metadata_path: Path, dataset_dir: Path) -> pd.DataFrame:
     metadata["midi_path"] = metadata["midi_filename"].map(
         lambda filename: dataset_dir / str(filename)
     )
+    metadata["source"] = "maestro"
+    return metadata
+
+
+def parse_giantmidi_composer(filename: str) -> str | None:
+    """Parse ``Surname, Firstname`` from GiantMIDI audio_name-style filenames.
+
+    Filenames look like ``Last, First, Title[, more title], youtubeId.mid``.
+    Composer is always the first two comma-separated fields (firstname may
+    contain spaces, e.g. ``Johann Sebastian``); the last field is the YouTube id.
+    """
+    stem = Path(filename).name
+    if not stem.lower().endswith(".mid"):
+        return None
+    parts = [part.strip() for part in stem[:-4].split(",")]
+    if len(parts) < 3:
+        return None
+    return f"{parts[0]}, {parts[1]}"
+
+
+def giantmidi_to_maestro_composer(raw_composer: str) -> str:
+    if raw_composer in GIANTMIDI_COMPOSER_ALIASES:
+        return GIANTMIDI_COMPOSER_ALIASES[raw_composer]
+    # Accent-insensitive alias lookup.
+    key = unicodedata.normalize("NFKD", raw_composer)
+    key = "".join(c for c in key if not unicodedata.combining(c))
+    for alias, target in GIANTMIDI_COMPOSER_ALIASES.items():
+        alias_key = unicodedata.normalize("NFKD", alias)
+        alias_key = "".join(c for c in alias_key if not unicodedata.combining(c))
+        if alias_key.lower() == key.lower():
+            return target
+    return raw_composer
+
+
+def stable_giantmidi_split(filename: str, val_fraction: float = GIANTMIDI_VAL_FRACTION) -> str:
+    digest = hashlib.sha1(filename.encode("utf-8")).hexdigest()
+    bucket = int(digest[:8], 16) / 0xFFFFFFFF
+    return "validation" if bucket < val_fraction else "train"
+
+
+def load_giantmidi_metadata(giantmidi_dir: Path) -> pd.DataFrame:
+    if not giantmidi_dir.exists():
+        raise FileNotFoundError(f"GiantMIDI directory not found: {giantmidi_dir}")
+
+    midi_paths = sorted(giantmidi_dir.rglob("*.mid"))
+    if not midi_paths:
+        raise FileNotFoundError(f"No .mid files under {giantmidi_dir}")
+
+    rows: list[dict[str, str]] = []
+    parse_failures = 0
+    for midi_path in midi_paths:
+        relative = midi_path.relative_to(DATASET_DIR).as_posix()
+        raw_composer = parse_giantmidi_composer(midi_path.name)
+        if raw_composer is None:
+            parse_failures += 1
+            logger.warning("Skipping GiantMIDI file with unparseable name: %s", midi_path)
+            continue
+        composer = giantmidi_to_maestro_composer(raw_composer)
+        split = stable_giantmidi_split(midi_path.name)
+        rows.append(
+            {
+                "midi_filename": relative,
+                "canonical_composer": composer,
+                "split": split,
+                "midi_path": str(midi_path),
+                "source": "giantmidi",
+            }
+        )
+
+    if not rows:
+        raise ValueError("No GiantMIDI rows after composer parsing")
+
+    metadata = pd.DataFrame(rows)
+    metadata["midi_path"] = metadata["midi_path"].map(Path)
+    logger.info(
+        "GiantMIDI metadata: %d files | parse_failures=%d | train=%d | val=%d",
+        len(metadata),
+        parse_failures,
+        int((metadata["split"] == "train").sum()),
+        int((metadata["split"] == "validation").sum()),
+    )
+    return metadata
+
+
+def build_unified_metadata(
+    maestro_path: Path,
+    dataset_dir: Path,
+    giantmidi_dir: Path,
+) -> pd.DataFrame:
+    maestro = load_maestro_metadata(maestro_path, dataset_dir)
+    if giantmidi_dir.exists() and any(giantmidi_dir.rglob("*.mid")):
+        giant = load_giantmidi_metadata(giantmidi_dir)
+        metadata = pd.concat([maestro, giant], ignore_index=True)
+    else:
+        logger.warning(
+            "GiantMIDI dir missing or empty (%s); using MAESTRO only",
+            giantmidi_dir,
+        )
+        metadata = maestro
     return metadata
 
 
@@ -215,7 +367,25 @@ def build_tokenizer(composer_groups: list[str] | None = None) -> ComposerREMI:
     return ComposerREMI(config)
 
 
-def validate_midi_file(midi_path: Path) -> bool:
+def max_polyphony(midi: pretty_midi.PrettyMIDI) -> int:
+    events: list[tuple[float, int]] = []
+    for instrument in midi.instruments:
+        for note in instrument.notes:
+            events.append((note.start, 1))
+            events.append((note.end, -1))
+    if not events:
+        return 0
+    events.sort(key=lambda item: (item[0], item[1]))
+    current = 0
+    peak = 0
+    for _, delta in events:
+        current += delta
+        if current > peak:
+            peak = current
+    return peak
+
+
+def validate_midi_file(midi_path: Path, *, apply_quality_filter: bool) -> bool:
     try:
         midi = pretty_midi.PrettyMIDI(str(midi_path))
     except Exception as exc:
@@ -225,6 +395,33 @@ def validate_midi_file(midi_path: Path) -> bool:
     note_count = sum(len(instrument.notes) for instrument in midi.instruments)
     if note_count == 0:
         logger.warning("Skipping MIDI file without notes: %s", midi_path)
+        return False
+
+    if not apply_quality_filter:
+        return True
+
+    duration = float(midi.get_end_time())
+    if duration <= 0.0:
+        logger.warning("Skipping MIDI with non-positive duration: %s", midi_path)
+        return False
+
+    density = note_count / duration
+    if density < MIN_NOTES_PER_SEC or density > MAX_NOTES_PER_SEC:
+        logger.debug(
+            "Skipping MIDI for note density %.2f notes/s: %s",
+            density,
+            midi_path,
+        )
+        return False
+
+    polyphony = max_polyphony(midi)
+    if polyphony > MAX_POLYPHONY:
+        logger.debug(
+            "Skipping MIDI for max polyphony %d > %d: %s",
+            polyphony,
+            MAX_POLYPHONY,
+            midi_path,
+        )
         return False
 
     return True
@@ -237,9 +434,10 @@ def as_token_sequences(tokens: TokSequence | list[TokSequence]) -> list[TokSeque
 def collect_split_records(
     metadata: pd.DataFrame,
     split: str,
-) -> tuple[list[MidiRecord], int]:
+) -> tuple[list[MidiRecord], int, int]:
     records: list[MidiRecord] = []
     missing_files = 0
+    quality_rejects = 0
     split_rows = metadata[metadata["split"].astype(str).str.lower() == split]
     for row in split_rows.itertuples(index=False):
         midi_path = Path(row.midi_path)
@@ -247,7 +445,11 @@ def collect_split_records(
             logger.warning("Skipping missing MIDI file: %s", midi_path)
             missing_files += 1
             continue
-        if not validate_midi_file(midi_path):
+        source = str(getattr(row, "source", "maestro"))
+        apply_quality = source == "giantmidi"
+        if not validate_midi_file(midi_path, apply_quality_filter=apply_quality):
+            if apply_quality:
+                quality_rejects += 1
             continue
         records.append(
             MidiRecord(
@@ -256,7 +458,7 @@ def collect_split_records(
                 split=str(row.split),
             )
         )
-    return records, missing_files
+    return records, missing_files, quality_rejects
 
 
 def chunk_base_ids(ids: list[int], max_seq_len: int, stride: int) -> list[list[int]]:
@@ -349,25 +551,35 @@ def main() -> None:
     )
 
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-    metadata = load_metadata(METADATA_PATH, DATASET_DIR)
+    metadata = build_unified_metadata(METADATA_PATH, DATASET_DIR, GIANTMIDI_DIR)
+    metadata.to_csv(UNIFIED_METADATA_PATH, index=False)
     composer_mapping = build_composer_mapping(metadata)
     composer_groups = build_composer_groups(composer_mapping)
 
+    source_counts = metadata["source"].value_counts().to_dict()
     logger.info(
-        "Loaded %d metadata rows | composers=%d | conditioned groups=%d",
+        "Loaded %d metadata rows | sources=%s | composers=%d | conditioned groups=%d",
         len(metadata),
+        source_counts,
         len(composer_mapping),
         len(composer_groups),
     )
 
-    train_records, train_missing = collect_split_records(metadata, "train")
-    val_records, val_missing = collect_split_records(metadata, "validation")
+    train_records, train_missing, train_rejects = collect_split_records(
+        metadata, "train"
+    )
+    val_records, val_missing, val_rejects = collect_split_records(
+        metadata, "validation"
+    )
     logger.info(
-        "Valid MIDI files: train=%d (missing %d) | validation=%d (missing %d)",
+        "Valid MIDI files: train=%d (missing %d, quality_reject %d) | "
+        "validation=%d (missing %d, quality_reject %d)",
         len(train_records),
         train_missing,
+        train_rejects,
         len(val_records),
         val_missing,
+        val_rejects,
     )
 
     tokenizer = build_tokenizer(composer_groups)
@@ -380,7 +592,7 @@ def main() -> None:
     tokenizer.train(
         vocab_size=BPE_VOCAB_SIZE,
         model="BPE",
-        files_paths=[record.midi_path for record in train_records],
+        files_paths=[str(record.midi_path) for record in train_records],
     )
     assert tokenizer.is_trained, "BPE training did not mark the tokenizer trained"
     # The learned BPE model is serialized inside the same params file, so a

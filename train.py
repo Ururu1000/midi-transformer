@@ -29,21 +29,25 @@ TOKENIZER_PATH = Path("data/processed/tokenizer.json")
 CHECKPOINTS_DIR = Path("checkpoints")
 CHECKPOINT_PATTERN = re.compile(r"model_epoch_(\d+)\.pt$")
 
-# L4 24GB: seq 4096 attention is ~4x seq 2048. Batch 12 + accum 7 ≈ effective 84.
+# L4 24GB: seq 4096 attention is ~4x seq 2048. Batch 8 + accum 7 ≈ effective 56.
 # The block-diagonal attn_mask routes SDPA to the memory-efficient backend
-# (flash kernels reject arbitrary masks); drop to 8 if the L4 OOMs.
-BATCH_SIZE = 12
+# (flash kernels reject arbitrary masks); drop further if the L4 OOMs.
+BATCH_SIZE = 8
 # MPS/CPU have no flash-attention kernel, so SDPA materializes the full
 # (batch, heads, seq, seq) score matrix. Keep local smoke tests tiny.
 LOCAL_BATCH_SIZE = 1
-GRADIENT_ACCUMULATION_STEPS = 7
+GRADIENT_ACCUMULATION_STEPS = 16
 NUM_EPOCHS = 50
 WARMUP_EPOCHS = 5
-LEARNING_RATE = 3e-4
-WEIGHT_DECAY = 0.01
+LEARNING_RATE = 2e-4
+WEIGHT_DECAY = 0.02
 MAX_GRAD_NORM = 1.0
 LOG_EVERY = 10
 SEED = 42
+# Stop once validation fails to improve for this many epochs in a row.
+EARLY_STOP_PATIENCE = 5
+DROPOUT = 0.1
+LABEL_SMOOTHING = 0.0
 
 # Fraction of training rows whose composer tokens are swapped for the
 # unconditional token, so the same weights model p(x) and p(x | composer).
@@ -54,6 +58,9 @@ NUM_WORKERS = 4
 
 # The RMSNorm/SwiGLU/KV-cache architecture is incompatible with old checkpoints.
 RESUME_TRAINING = False
+# Load model weights + epoch/step counters only; fresh optimizer/scheduler/scaler.
+RESUME_WEIGHTS_ONLY = True
+RESUME_CHECKPOINT_PATH = CHECKPOINTS_DIR / "model_best.pt"
 
 # Whole documents are bin-packed into PACK_SEQ_LEN rows. Every row carries
 # doc_ids so attention is block-diagonal: no token ever attends across a
@@ -338,6 +345,7 @@ def save_checkpoint(
     checkpoint_path: Path,
     *,
     epoch: int,
+    global_step: int,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
@@ -349,6 +357,7 @@ def save_checkpoint(
 ) -> None:
     payload = {
         "epoch": epoch,
+        "global_step": global_step,
         "model_state_dict": get_model_state_dict(model),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
@@ -366,6 +375,49 @@ def save_checkpoint(
     temp_path.replace(checkpoint_path)
 
 
+def _read_checkpoint_counters(
+    checkpoint: dict[str, Any],
+    batches_per_epoch: int,
+) -> tuple[int, int, float, str | None]:
+    completed_epochs = int(checkpoint["epoch"])
+    global_step = int(
+        checkpoint.get("global_step", completed_epochs * batches_per_epoch)
+    )
+    best_val_loss = float(checkpoint.get("best_val_loss", float("inf")))
+    wandb_run_id = checkpoint.get("wandb_run_id")
+    return completed_epochs, global_step, best_val_loss, wandb_run_id
+
+
+def resume_weights_only(
+    checkpoint_path: Path,
+    model: nn.Module,
+    device: torch.device,
+    batches_per_epoch: int,
+) -> tuple[int, int, float, str | None]:
+    """Load model weights and loop counters; optimizer must stay fresh."""
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Resume checkpoint not found: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    load_model_state_dict(model, checkpoint["model_state_dict"])
+
+    completed_epochs, global_step, best_val_loss, wandb_run_id = _read_checkpoint_counters(
+        checkpoint, batches_per_epoch
+    )
+
+    logger.info(
+        "Resumed weights only from %s at epoch %d step %d | best val %.4f | "
+        "optimizer/scaler fresh (dropout=%.2f weight_decay=%.2f)",
+        checkpoint_path,
+        completed_epochs,
+        global_step,
+        best_val_loss,
+        DROPOUT,
+        WEIGHT_DECAY,
+    )
+    return completed_epochs, global_step, best_val_loss, wandb_run_id
+
+
 def resume_from_checkpoint(
     checkpoint_path: Path | None,
     model: nn.Module,
@@ -373,23 +425,23 @@ def resume_from_checkpoint(
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     scaler: torch.amp.GradScaler,
     device: torch.device,
-) -> tuple[int, float, str | None]:
+    batches_per_epoch: int,
+) -> tuple[int, int, float, str | None]:
     if checkpoint_path is None or not checkpoint_path.exists():
         logger.warning("No checkpoint found, training from scratch")
-        return 0, float("inf"), None
+        return 0, 0, float("inf"), None
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
     load_model_state_dict(model, checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
-    completed_epochs = int(checkpoint["epoch"])
-    best_val_loss = float(checkpoint.get("best_val_loss", float("inf")))
-    wandb_run_id = checkpoint.get("wandb_run_id")
+    completed_epochs, global_step, best_val_loss, wandb_run_id = _read_checkpoint_counters(
+        checkpoint, batches_per_epoch
+    )
 
     if "scheduler_state_dict" in checkpoint:
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
     else:
-        # Backward-compatible fallback for older checkpoints without scheduler.
         logger.warning(
             "Checkpoint missing scheduler_state_dict; advancing scheduler %d steps",
             completed_epochs,
@@ -408,12 +460,18 @@ def resume_from_checkpoint(
         logger.warning("Checkpoint missing rng_state; RNG continuity not restored")
 
     logger.info(
-        "Resumed from %s at epoch %d | LR %.2e",
+        "Resumed from %s at epoch %d step %d | LR %.2e",
         checkpoint_path,
         completed_epochs,
+        global_step,
         scheduler.get_last_lr()[0],
     )
-    return completed_epochs, best_val_loss, wandb_run_id
+    return completed_epochs, global_step, best_val_loss, wandb_run_id
+
+
+def advance_scheduler(scheduler: torch.optim.lr_scheduler.LRScheduler, steps: int) -> None:
+    for _ in range(steps):
+        scheduler.step()
 
 
 def init_wandb(
@@ -447,9 +505,13 @@ def init_wandb(
             "max_grad_norm": MAX_GRAD_NORM,
             "seed": SEED,
             "cfg_drop_prob": CFG_DROP_PROB,
+            "early_stop_patience": EARLY_STOP_PATIENCE,
+            "dropout": DROPOUT,
+            "label_smoothing": LABEL_SMOOTHING,
             "num_workers": NUM_WORKERS,
             "max_seq_len": PACK_SEQ_LEN,
             "resume_training": RESUME_TRAINING,
+            "resume_weights_only": RESUME_WEIGHTS_ONLY,
             "device": str(device),
             "vocab_size": vocab_size,
             "num_params_m": num_params_m,
@@ -505,6 +567,7 @@ def train_one_epoch(
                 logits.reshape(-1, vocab_size),
                 targets.reshape(-1),
                 ignore_index=pad_token_id,
+                label_smoothing=LABEL_SMOOTHING,
             )
 
         # Scale so accumulated gradients match the mean over the effective batch.
@@ -655,11 +718,31 @@ def main() -> None:
         pin_memory=device.type == "cuda",
     )
 
-    # Build optimizer/scheduler on the raw module, resume, then compile so
-    # checkpoint keys stay portable and parameter identity is preserved.
-    model: nn.Module = MusicTransformer(vocab_size=vocab_size).to(device)
+    batches_per_epoch = len(train_loader)
+
+    # Build model first; weights-only resume loads weights before a fresh optimizer.
+    model: nn.Module = MusicTransformer(
+        vocab_size=vocab_size,
+        dropout=DROPOUT,
+    ).to(device)
     num_params_m = unwrap_model(model).get_num_params()
     logger.info("Model parameters: %.2fM", num_params_m)
+
+    completed_epochs = 0
+    global_step = 0
+    best_val_loss = float("inf")
+    epochs_without_improvement = 0
+    wandb_run_id: str | None = None
+
+    if RESUME_WEIGHTS_ONLY:
+        completed_epochs, global_step, best_val_loss, wandb_run_id = resume_weights_only(
+            RESUME_CHECKPOINT_PATH,
+            model,
+            device,
+            batches_per_epoch,
+        )
+    elif RESUME_TRAINING:
+        logger.info("RESUME_TRAINING enabled; full state resume including optimizer")
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -683,18 +766,24 @@ def main() -> None:
         milestones=[WARMUP_EPOCHS],
     )
 
-    completed_epochs = 0
-    best_val_loss = float("inf")
-    wandb_run_id: str | None = None
-    if RESUME_TRAINING:
+    if RESUME_WEIGHTS_ONLY:
+        advance_scheduler(scheduler, completed_epochs)
+        logger.info(
+            "Fresh AdamW (wd=%.2f) and scheduler aligned to epoch %d | LR %.2e",
+            WEIGHT_DECAY,
+            completed_epochs,
+            scheduler.get_last_lr()[0],
+        )
+    elif RESUME_TRAINING:
         latest_checkpoint = find_latest_checkpoint(CHECKPOINTS_DIR)
-        completed_epochs, best_val_loss, wandb_run_id = resume_from_checkpoint(
+        completed_epochs, global_step, best_val_loss, wandb_run_id = resume_from_checkpoint(
             latest_checkpoint,
             model,
             optimizer,
             scheduler,
             scaler,
             device,
+            batches_per_epoch,
         )
     else:
         logger.info(
@@ -708,7 +797,9 @@ def main() -> None:
         num_params_m=num_params_m,
         train_dataset_size=len(train_dataset),
         val_dataset_size=len(val_dataset),
-        resume_run_id=wandb_run_id if RESUME_TRAINING else None,
+        resume_run_id=wandb_run_id
+        if RESUME_TRAINING or RESUME_WEIGHTS_ONLY
+        else None,
     )
     use_wandb = wandb_run is not None
     if use_wandb:
@@ -719,7 +810,6 @@ def main() -> None:
         model = torch.compile(model)
 
     start_epoch = completed_epochs + 1
-    global_step = completed_epochs * len(train_loader)
 
     try:
         for epoch in range(start_epoch, NUM_EPOCHS + 1):
@@ -769,6 +859,7 @@ def main() -> None:
             save_checkpoint(
                 checkpoint_path,
                 epoch=epoch,
+                global_step=global_step,
                 model=model,
                 optimizer=optimizer,
                 scheduler=scheduler,
@@ -782,10 +873,12 @@ def main() -> None:
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
+                epochs_without_improvement = 0
                 best_checkpoint_path = CHECKPOINTS_DIR / "model_best.pt"
                 save_checkpoint(
                     best_checkpoint_path,
                     epoch=epoch,
+                    global_step=global_step,
                     model=model,
                     optimizer=optimizer,
                     scheduler=scheduler,
@@ -800,6 +893,21 @@ def main() -> None:
                     best_checkpoint_path,
                     best_val_loss,
                 )
+            else:
+                epochs_without_improvement += 1
+                logger.info(
+                    "No val improvement for %d/%d epochs (best=%.4f)",
+                    epochs_without_improvement,
+                    EARLY_STOP_PATIENCE,
+                    best_val_loss,
+                )
+                if epochs_without_improvement >= EARLY_STOP_PATIENCE:
+                    logger.info(
+                        "Early stopping at epoch %d | best val %.4f",
+                        epoch,
+                        best_val_loss,
+                    )
+                    break
 
             if device.type == "cuda":
                 torch.cuda.empty_cache()

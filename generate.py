@@ -21,24 +21,29 @@ TOKENIZER_PATH = Path("data/processed/tokenizer.json")
 OUTPUT_PATH = Path("data/processed/output.mid")
 
 COMPOSER = "Frédéric Chopin"
-# BPE packs more music per token than raw REMI, so 1536 is a solid piece length.
-GENERATION_LENGTH = 1536
-TEMPERATURE = 0.7
+GENERATION_LENGTH = 1024
+TEMPERATURE = 0.85
 # Min-P keeps every token whose probability is at least MIN_P times the top
 # token's probability. The cutoff scales with model confidence, which trims the
 # long tail without the fixed-mass distortion of nucleus sampling.
-MIN_P = 0.08
-# CFG amplifies the gap between the conditional and unconditional logits, which
-# distorts the distribution of a model that is not yet strongly fit. 1.0 = off.
-CFG_SCALE = 1.0
-REPETITION_PENALTY = 1.2
+MIN_P = 0.05
+# Mild CFG restores composer steering without the distribution collapse of 2.0+.
+CFG_SCALE = 1.5
+# Classical motifs reuse pitches; default off. Pitch-only window still available.
+REPETITION_PENALTY = 1.0
+# Penalize against recent context only. A whole-sequence window makes every
+# pitch progressively unusable, which starves long generations of material.
+PENALTY_WINDOW = 64
 # The training chunks never contained EOS, so its logit is unreliable early on.
 MIN_NEW_TOKENS = 96
-# Recomputing the full prefix every step is O(L^2) but keeps the sampling loop
-# free of any cache-state assumptions. Set True to use the incremental KV cache.
-USE_KV_CACHE = False
+# KV cache is numerically identical to full-prefix decoding; keep it on for speed.
+USE_KV_CACHE = True
 
 FORBIDDEN_PREFIXES = ("PAD", "BOS", "MASK", "Composer")
+PITCH_PREFIXES = ("Pitch", "PitchDrum")
+# Tokens that carry the rhythmic grid. Penalizing these starves the model of
+# the bar/beat vocabulary it must reuse constantly, which collapses timing.
+GRID_PREFIXES = ("Bar", "Position", "TimeShift", "Rest", "Chord", "Tempo")
 
 logger = logging.getLogger(__name__)
 
@@ -61,16 +66,31 @@ def iter_vocab_entries(tokenizer: REMI) -> list[tuple[int, list[str]]]:
 class TokenCategories:
     def __init__(self, tokenizer: REMI, device: torch.device) -> None:
         forbidden: list[int] = []
+        pitch: list[int] = []
+        vocab_size = len(tokenizer)
         for token_id, base_tokens in iter_vocab_entries(tokenizer):
             prefixes = {token.split("_")[0] for token in base_tokens}
             if prefixes & set(FORBIDDEN_PREFIXES):
                 forbidden.append(token_id)
+            # A BPE id may merge several base tokens. It only counts as a pitch
+            # token when it carries a pitch and no grid token, so penalizing it
+            # can never suppress a Bar/Position the model needs to keep time.
+            if prefixes & set(PITCH_PREFIXES) and not prefixes & set(GRID_PREFIXES):
+                pitch.append(token_id)
 
         self.eos_token_id = learned_token_id(tokenizer, "EOS_None")
         self.forbidden_ids = torch.tensor(
             sorted(set(forbidden) - {self.eos_token_id}),
             dtype=torch.long,
             device=device,
+        )
+        self.is_pitch = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+        if pitch:
+            self.is_pitch[torch.tensor(sorted(pitch), device=device)] = True
+        logger.info(
+            "Repetition penalty applies to %d/%d pitch-only ids",
+            int(self.is_pitch.sum().item()),
+            vocab_size,
         )
 
 
@@ -144,19 +164,29 @@ def min_p_filter(logits: Tensor, min_p: float) -> Tensor:
 
 def apply_repetition_penalty(
     logits: Tensor,
-    history: Tensor,
+    window: Tensor,
     penalty: float,
+    is_penalizable: Tensor,
 ) -> Tensor:
-    """Divide already-seen positive logits, multiply negative ones.
+    """Divide recently-used positive pitch logits, multiply negative ones.
 
     Scaling instead of subtracting keeps the penalty proportional to how much
     the model wants a token, so confident-but-repeated ids fall furthest.
+    Structural, temporal and special ids are never touched: REMI reuses them on
+    every note, so penalizing them would break the bar/beat grid.
     """
     assert logits.ndim == 1, f"Got {logits.shape}"
-    if penalty == 1.0 or history.numel() == 0:
+    assert is_penalizable.shape == logits.shape, (
+        f"Got {is_penalizable.shape} vs {logits.shape}"
+    )
+    if penalty == 1.0 or window.numel() == 0:
         return logits
 
-    seen = torch.unique(history)
+    seen = torch.unique(window)
+    seen = seen[is_penalizable[seen]]
+    if seen.numel() == 0:
+        return logits
+
     scores = logits[seen]
     logits[seen] = torch.where(scores > 0, scores / penalty, scores * penalty)
     return logits
@@ -173,10 +203,12 @@ def generate(
     min_p: float = MIN_P,
     cfg_scale: float = CFG_SCALE,
     repetition_penalty: float = REPETITION_PENALTY,
+    penalty_window: int = PENALTY_WINDOW,
 ) -> list[int]:
     assert temperature > 0.0, f"Got temperature={temperature}"
     assert 0.0 <= min_p < 1.0, f"Got min_p={min_p}"
     assert repetition_penalty >= 1.0, f"Got repetition_penalty={repetition_penalty}"
+    assert penalty_window > 0, f"Got penalty_window={penalty_window}"
 
     categories = TokenCategories(tokenizer, device)
     start_token = pick_start_token(tokenizer, composer)
@@ -246,8 +278,9 @@ def generate(
 
         next_logits = apply_repetition_penalty(
             next_logits,
-            generated[0, :step],
+            generated[0, max(0, step - penalty_window) : step],
             repetition_penalty,
+            categories.is_pitch,
         )
         next_logits = min_p_filter(next_logits / temperature, min_p)
         probs = F.softmax(next_logits, dim=-1)
@@ -336,6 +369,7 @@ def main() -> None:
         min_p=MIN_P,
         cfg_scale=CFG_SCALE,
         repetition_penalty=REPETITION_PENALTY,
+        penalty_window=PENALTY_WINDOW,
     )
     logger.info("Generated %d tokens", len(token_ids))
 
