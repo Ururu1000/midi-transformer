@@ -1,0 +1,17 @@
+/checkpoints
+/data/processed
+/venv/
+data/processed/
+*.pt
+*.pth
+/ai v4(new model).zip
+wandb/
+
+# Local junk / secrets / tooling
+/Y/
+.cursor/
+**/__pycache__/
+*.py[cod]
+.DS_Store
+**/.DS_Store
+/data/generated/
