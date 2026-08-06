@@ -1,4 +1,4 @@
-# Music-Generator: Symbolic Music Language Model
+# Symbolic Music Language Model
 
 [License: MIT](LICENSE)
 [Python 3.10+](https://www.python.org/downloads/)
@@ -7,8 +7,6 @@
 An advanced **AI-powered Autoregressive Symbolic Music Generator** built with a custom LLaMA-style Transformer architecture in PyTorch. The model is trained on classical piano MIDI corpora (MAESTRO v3.0.0 and GiantMIDI-Piano) using BPE-compressed REMI tokenization, Classifier-Free Guidance (CFG), and state-of-the-art sampling techniques to compose high-quality, composer-conditioned classical piano music.
 
 ---
-
-
 
 ## Key Features
 
@@ -58,8 +56,8 @@ ai-music-project/
 Ensure you have Python 3.10+ and PyTorch installed:
 
 ```bash
-git clone https://github.com/Ururu1000/music-generator.git
-cd music-generator
+git clone https://github.com/Ururu1000/midi-transformer.git
+cd midi-transformer
 
 # Create and activate virtual environment
 python -m venv venv

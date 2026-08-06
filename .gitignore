@@ -14,5 +14,4 @@ wandb/
 *.py[cod]
 .DS_Store
 **/.DS_Store
-.gitignore
-/data/generated
+/data/generated/
