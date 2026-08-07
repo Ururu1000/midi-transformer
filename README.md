@@ -164,7 +164,7 @@ The script calculates:
 | `vocab_size`  | ~2,048 | BPE Tokenizer Vocabulary      |
 | `d_model`     | 768    | Hidden Embedding Dimension    |
 | `nhead`       | 12     | Multi-Head Attention Heads    |
-| `num_layers`  | 16     | Transformer Decoder Blocks    |
+| `num_layers`  | 24     | Transformer Decoder Blocks    |
 | `d_ff`        | 3,072  | SwiGLU Hidden Layer Dimension |
 | `max_seq_len` | 4,096  | Context Window Length         |
 

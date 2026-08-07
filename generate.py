@@ -16,7 +16,7 @@ from scripts.tokenize_midi import (
     learned_token_id,
 )
 
-CHECKPOINT_PATH = Path("checkpoints/model_best.pt")
+CHECKPOINT_PATH = Path("checkpoints/model_best_ancient_tree17.pt")
 TOKENIZER_PATH = Path("data/processed/tokenizer.json")
 OUTPUT_PATH = Path("data/processed/output.mid")
 

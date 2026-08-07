@@ -15,3 +15,6 @@ wandb/
 .DS_Store
 **/.DS_Store
 /data/generated/
+upload_to_hf.py
+app.py
+requirements.txt
