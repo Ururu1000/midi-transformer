@@ -222,10 +222,10 @@ class MusicTransformer(nn.Module):
         vocab_size: int,
         d_model: int = 768,
         nhead: int = 12,
-        num_layers: int = 16,
-        d_ff: int =    3072,
+        num_layers: int = 24,
+        d_ff: int = 3072,
         max_seq_len: int = 4096,
-        dropout: float = 0.2,
+        dropout: float = 0.1,
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size

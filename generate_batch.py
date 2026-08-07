@@ -9,7 +9,7 @@ from generate import generate, load_model, tokens_to_midi_file
 from model import get_device
 from scripts.tokenize_midi import ComposerREMI
 
-CHECKPOINT_PATH = Path("checkpoints/model_best.pt")
+CHECKPOINT_PATH = Path("checkpoints/model_best_ancient_tree17.pt")
 TOKENIZER_PATH = Path("data/processed/tokenizer.json")
 OUTPUT_DIR = Path("data/generated")
 

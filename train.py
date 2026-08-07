@@ -519,7 +519,7 @@ def init_wandb(
             "val_dataset_size": val_dataset_size,
             "d_model": 768,
             "nhead": 12,
-            "num_layers": 16,
+            "num_layers": 24,
             "d_ff": 3072,
         },
     }
