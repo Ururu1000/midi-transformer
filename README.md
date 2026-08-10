@@ -18,7 +18,13 @@ An advanced **AI-powered Autoregressive Symbolic Music Generator** built with a 
   - **KV-Caching** for fast step-by-step autoregressive decoding.
   - **Min-P Sampling** to eliminate low-probability long-tail tokens without distoring confidence scaling.
   - **Pitch-Only Repetition Penalties** to prevent melodic stagnation without destroying rhythmic grid integrity (`Bar`, `Position`, `Tempo`).
-- **Statistical Evaluation Suite**: Evaluates generated MIDI files against ground truth corpora using **Pitch Class Histograms (PCH)**, **KL Divergence**, note density, and active duration metrics.
+- **Statistical Evaluation Suite**: 
+   Scale Consistency – Krumhansl-Schmuckler key detection + in-key note rate
+   Pitch Class Entropy – Shannon entropy of the 12-bin pitch class histogram
+   Pitch Range – semitone span between lowest and highest pitch
+   Polyphony Rate & Note Density with KL Divergence across corpora
+   Groove Consistency  – Inter-Onset Interval (IOI) histogram analysis
+   Compression Ratio / Structure – LZ77 (zlib) compression of a note string
 
 ---
 
@@ -32,7 +38,7 @@ ai-music-project/
 ├── train.py                # Training loop (AMP, Gradient Accumulation, W&B, Early Stopping)
 ├── generate.py             # Inference engine (KV-Cache decoding, CFG, Min-P, Repetition Penalty)
 ├── generate_batch.py       # Batch generation script for bulk sampling across composers
-├── evaluate.py             # Quantitative evaluation (KL Divergence, Pitch Class Histograms, Note Density)
+├── evaluate_advanded.py    # Quantitative evaluation
 ├── scripts/
 │   └── tokenize_midi.py    # MIDI dataset preprocessing, filtering, BPE tokenization & augmentation
 ├── checkpoints/            # Directory for trained model weights (e.g., model_best.pt)
@@ -140,17 +146,26 @@ Generated `.mid` files will be saved in `data/generated/`. You can play them usi
 
 ## Quantitative Evaluation
 
-Evaluate the musical quality of generated samples against the validation dataset:
+Evaluate the musical quality and statistical characteristics of generated samples against a validation dataset:
 
 ```bash
-python evaluate.py
+python evaluate_advanced.py data/generated data/raw_midi/validation
 ```
 
-The script calculates:
+Optionally export the summary comparison table to a CSV file:
 
-- **Pitch Class Histogram (PCH) Distribution**: Measuring tonal center adherence.
-- **KL Divergence**: Statistical similarity between generated pitch distributions and classical compositions.
-- **Note Density & Active Duration**: Ensuring realistic note rates without silent gaps or excessive clutter.
+```bash
+python evaluate_advanced.py data/generated data/raw_midi/validation --csv evaluation_summary.csv
+```
+
+`evaluate_advanced.py` performs statistical comparative analysis across **6 metric families**:
+
+- **Scale Consistency**: Detects key and tonal centers using the Krumhansl-Schmuckler algorithm and evaluates the in-key note ratio.
+- **Pitch Class Entropy**: Measures Shannon entropy across 12-bin pitch class histograms to assess pitch distribution variety vs structure.
+- **Pitch Range**: Calculates semitone spans between lowest and highest pitches across compositions.
+- **Polyphony Rate, Note Density & KL Divergence**: Computes average concurrent sounding notes and note rates, along with Kullback-Leibler (KL) divergence against validation distributions.
+- **Groove Consistency**: Analyzes Inter-Onset Interval (IOI) timing statistics and histograms to measure rhythmic flow.
+- **Structural Repetition & Compression**: Evaluates LZ77 (zlib) compression ratios of pitch-duration patterns to quantify structural coherence and repetition.
 
 ---
 
