@@ -1,193 +1,169 @@
 # Symbolic Music Language Model
 
 [License: MIT](LICENSE)
-[Python 3.10+](https://www.python.org/downloads/)
-[PyTorch](https://pytorch.org/)
 
-An advanced **AI-powered Autoregressive Symbolic Music Generator** built with a custom LLaMA-style Transformer architecture in PyTorch. The model is trained on classical piano MIDI corpora (MAESTRO v3.0.0 and GiantMIDI-Piano) using BPE-compressed REMI tokenization, Classifier-Free Guidance (CFG), and state-of-the-art sampling techniques to compose high-quality, composer-conditioned classical piano music.
+An **AI-powered autoregressive symbolic music generator** built with a custom LLaMA-style Transformer architecture in PyTorch. The model is trained on classical piano MIDI corpora (MAESTRO v3.0.0 and GiantMIDI-Piano) using BPE-compressed REMI tokenization, Classifier-Free Guidance (CFG), and modern sampling techniques to compose composer-conditioned classical piano music.
 
 ---
 
 ## Key Features
 
-- **LLaMA-Style Transformer Architecture**: Implemented from scratch featuring **Rotary Position Embeddings (RoPE)**, **SwiGLU** feed-forward networks, **RMSNorm**, and weight-tied embedding heads.
-- **Block-Diagonal Attention Masking**: Bin-packs multiple MIDI pieces into fixed-length 4096-token sequence rows with custom attention masks (`doc_ids`) to prevent cross-piece attention leakage without wasting compute on zero-padding.
-- **BPE-Compressed REMI Tokenization**: Customized `ComposerREMI` representation with **Byte-Pair Encoding (2,048 vocabulary size)**, 12 positions per beat (triplets & rubato support), rests, chords, and pitch-shift data augmentations ($-6$ to $+5$ semitones).
-- **Composer-Conditioned Generation**: Steering via **Classifier-Free Guidance (CFG)** across top classical composers (e.g., *Frédéric Chopin*, *Johann Sebastian Bach*, *Ludwig van Beethoven*, *Franz Liszt*, *Claude Debussy*, *Sergei Rachmaninoff*, etc.).
-- **Advanced Sampling & Inference**:
-  - **KV-Caching** for fast step-by-step autoregressive decoding.
-  - **Min-P Sampling** to eliminate low-probability long-tail tokens without distoring confidence scaling.
-  - **Pitch-Only Repetition Penalties** to prevent melodic stagnation without destroying rhythmic grid integrity (`Bar`, `Position`, `Tempo`).
-- **Statistical Evaluation Suite**: 
-   Scale Consistency – Krumhansl-Schmuckler key detection + in-key note rate
-   Pitch Class Entropy – Shannon entropy of the 12-bin pitch class histogram
-   Pitch Range – semitone span between lowest and highest pitch
-   Polyphony Rate & Note Density with KL Divergence across corpora
-   Groove Consistency  – Inter-Onset Interval (IOI) histogram analysis
-   Compression Ratio / Structure – LZ77 (zlib) compression of a note string
+- **LLaMA-Style Transformer Architecture**: implemented from scratch — **Rotary Position Embeddings (RoPE)**, **SwiGLU** feed-forward networks, **RMSNorm**, and weight-tied embedding heads.
+- **Block-Diagonal Attention Masking**: bin-packs multiple MIDI pieces into fixed-length 4096-token rows with `doc_ids` masks to prevent cross-piece attention leakage without wasting compute on padding.
+- **BPE-Compressed REMI Tokenization**: customized `ComposerREMI` with **Byte-Pair Encoding (2,048 vocabulary)**, 12 positions per beat (triplets & rubato), rests, chords, and pitch-shift augmentation (−6 to +5 semitones).
+- **Composer-Conditioned Generation**: steering via **Classifier-Free Guidance (CFG)** across top composers (*Chopin*, *Bach*, *Beethoven*, *Liszt*, *Debussy*, *Rachmaninoff*, …).
+- **Advanced Sampling & Inference**: KV-caching, Min-P sampling, pitch-only repetition penalties that protect the rhythmic grid, optional seeding for reproducible runs.
+- **Statistical Evaluation Suite**: 6 metric families compared against a validation corpus (see below).
 
 ---
-
-
 
 ## Repository Structure
 
 ```text
 ai-music-project/
-├── model.py                # PyTorch MusicTransformer architecture (RoPE, SwiGLU, RMSNorm, KV-Cache)
-├── train.py                # Training loop (AMP, Gradient Accumulation, W&B, Early Stopping)
-├── generate.py             # Inference engine (KV-Cache decoding, CFG, Min-P, Repetition Penalty)
-├── generate_batch.py       # Batch generation script for bulk sampling across composers
-├── evaluate_advanded.py    # Quantitative evaluation
+├── pyproject.toml            # Package metadata, pinned deps, ruff & pytest config
+├── src/musiclm/
+│   ├── config.py             # Paths + ModelConfig / TrainConfig / GenerateConfig
+│   ├── model.py              # MusicTransformer (RoPE, SwiGLU, RMSNorm, KV-cache)
+│   ├── data/
+│   │   ├── tokenizer.py      # ComposerREMI + vocabulary helpers (miditok adapter)
+│   │   ├── preprocess.py     # Dataset prep: metadata, filters, BPE training, tokenization
+│   │   └── dataset.py        # PackedMusicDataset (bin-packing + doc_ids)
+│   ├── training/
+│   │   ├── trainer.py        # Training loop (AMP, grad accumulation, W&B, early stopping)
+│   │   └── cli.py            # musiclm-train entry point
+│   ├── inference/
+│   │   ├── sampler.py        # Generation engine (KV-cache, CFG, min-p, rep penalty)
+│   │   ├── cli.py            # musiclm-generate entry point
+│   │   └── batch.py          # musiclm-batch preset runner
+│   ├── evaluation/
+│   │   ├── metrics.py        # Statistical metrics suite
+│   │   └── cli.py            # musiclm-eval entry point
+│   └── app.py                # Gradio web UI (musiclm-app)
+├── tests/                    # pytest suite (mask, packing, sampler, metrics, tokenizer)
 ├── scripts/
-│   └── tokenize_midi.py    # MIDI dataset preprocessing, filtering, BPE tokenization & augmentation
-├── checkpoints/            # Directory for trained model weights (e.g., model_best.pt)
-├── data/
-│   ├── raw_midi/           # Datasets (MAESTRO v3.0.0 & GiantMIDI-Piano)
-│   ├── processed/          # BPE tokenizer, composer mappings, tokenized PyTorch tensors
-│   └── generated/          # Output generated MIDI files
-└── LICENSE                 # MIT License
+│   ├── download_data.sh      # Fetch MAESTRO (+ GiantMIDI instructions)
+│   ├── tokenize_midi.py      # Shim -> musiclm-tokenize
+│   └── upload_to_hf.py       # Publish checkpoint/tokenizer to Hugging Face Hub
+├── checkpoints/              # Trained weights (not source-controlled)
+└── data/                     # raw_midi / processed / generated (not source-controlled)
 ```
 
 ---
-
-
 
 ## Quick Start
 
+### 1. Installation
 
-
-### 1. Installation & Setup
-
-Ensure you have Python 3.10+ and PyTorch installed:
+Requires Python 3.9+:
 
 ```bash
-git clone https://github.com/Ururu1000/midi-transformer.git
-cd midi-transformer
+git clone https://github.com/Ururu1000/music-generator.git
+cd music-generator
 
-# Create and activate virtual environment
 python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+source venv/bin/activate          # On Windows: venv\Scripts\activate
 
-# Install dependencies
-pip install torch miditok pretty_midi pandas scipy wandb
+pip install -e .                  # core library + CLIs
+pip install -e '.[app]'           # + Gradio web app
+pip install -e '.[dev]'           # + pytest/ruff for development
 ```
 
-
-
-### 2. Dataset Preparation & Tokenization
-
-Download the [MAESTRO v3.0.0 dataset](https://magenta.tensorflow.org/datasets/maestro) or GiantMIDI into `data/raw_midi/`, then run the tokenization pipeline:
+### 2. Dataset Preparation
 
 ```bash
-python scripts/tokenize_midi.py
+bash scripts/download_data.sh     # downloads MAESTRO v3.0.0 into data/raw_midi/
+musiclm-tokenize                  # quality gates, BPE vocab (~2048), token tensors
 ```
 
-This pipeline cleans MIDI files, applies quality gates (polyphony & note density limits), builds the BPE vocabulary, transposes audio across 12 semitones, and saves tokenized PyTorch tensors (`tokens_train.pt`, `tokens_val.pt`).
+This produces `data/processed/tokens_train.pt`, `tokens_val.pt` and the tokenizer (with the learned BPE model serialized inside).
+
+### 3. Training
+
+```bash
+musiclm-train                     # resume_mode=weights by default
+```
+
+Useful flags:
+
+```bash
+musiclm-train --resume-mode none --epochs 50    # fresh training run
+musiclm-train --resume-mode full                # restore optimizer/scheduler/RNG too
+musiclm-train --no-wandb                        # disable experiment tracking
+```
+
+Defaults (overridable via CLI): `pack_seq_len` 4096 · batch 8 × 16 accumulation = effective 128 · LR 2e-4 cosine with 5 warmup epochs · CFG dropout 15% · early-stop patience 5. Metrics log to Weights & Biases automatically.
+
+### 4. Music Generation
+
+```bash
+musiclm-generate --composer "Frédéric Chopin" --length 1024 --seed 42 \
+                 --output data/generated/chopin.mid
+```
+
+Sampling defaults (`src/musiclm/config.py::GenerateConfig`):
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `temperature` | 0.92 | Sampling temperature |
+| `min_p` | 0.02 | Min-P confidence threshold |
+| `cfg_scale` | 1.2 | Classifier-Free Guidance strength (1.0 = off) |
+| `repetition_penalty` | 1.0 | Pitch-only repetition suppression (window 64) |
+| `seed` | none | Set it for reproducible sampling |
+
+Bulk A/B sampling across composers:
+
+```bash
+musiclm-batch --output-dir data/generated
+```
+
+Play the `.mid` files in any MIDI player or DAW (Ableton, FL Studio, GarageBand).
+
+### 5. Interactive Web App
+
+```bash
+musiclm-app
+```
+
+Gradio UI: pick a composer, tweak sliders, generate, preview audio, download MIDI.
+
+### 6. Quantitative Evaluation
+
+```bash
+musiclm-eval data/generated data/raw_midi/validation --csv evaluation_summary.csv
+```
+
+Compares generated vs validation corpora across **6 metric families**:
+
+- **Scale Consistency**: Krumhansl-Schmuckler key detection + in-key note ratio
+- **Pitch Class Entropy**: Shannon entropy of 12-bin pitch-class histograms
+- **Pitch Range**: semitone span statistics
+- **Polyphony Rate & Note Density**: plus KL divergence vs validation distributions
+- **Groove Consistency**: Inter-Onset Interval (IOI) statistics and histogram KLD
+- **Structural Compression**: LZ77 compression ratios of pitch-duration patterns
 
 ---
-
-
-
-## Training
-
-To launch model training:
-
-```bash
-python train.py
-```
-
-Key training parameters (configured in `train.py`):
-
-- `PACK_SEQ_LEN`: 4096 tokens
-- `BATCH_SIZE`: 8 (Effective batch size ~56 via gradient accumulation)
-- `LEARNING_RATE`: 2e-4 with Cosine Warmup Scheduler
-- `CFG_DROP_PROB`: 15% probability of dropping composer tokens for CFG learning
-- `EARLY_STOP_PATIENCE`: 5 validation epochs
-
-Training loss and evaluation metrics will log automatically to **Weights & Biases (W&B)**.
-
----
-
-
-
-## Music Generation
-
-Generate new classical piano compositions using a trained checkpoint:
-
-```bash
-python generate.py
-```
-
-
-
-### Sampling Parameters (`generate.py`)
-
-```python
-COMPOSER = "Frédéric Chopin"   # Composer steering prompt
-GENERATION_LENGTH = 1024       # Output sequence length
-TEMPERATURE = 0.95             # Sampling temperature
-MIN_P = 0.03                   # Min-P confidence threshold
-CFG_SCALE = 1.2                # Classifier-Free Guidance strength
-PENALTY_WINDOW = 64            # Pitch repetition penalty context window
-```
-
-To generate samples across multiple composers concurrently:
-
-```bash
-python generate_batch.py
-```
-
-Generated `.mid` files will be saved in `data/generated/`. You can play them using any standard MIDI player or Digital Audio Workstation (DAW) like Ableton, FL Studio, or GarageBand.
-
----
-
-
-
-## Quantitative Evaluation
-
-Evaluate the musical quality and statistical characteristics of generated samples against a validation dataset:
-
-```bash
-python evaluate_advanced.py data/generated data/raw_midi/validation
-```
-
-Optionally export the summary comparison table to a CSV file:
-
-```bash
-python evaluate_advanced.py data/generated data/raw_midi/validation --csv evaluation_summary.csv
-```
-
-`evaluate_advanced.py` performs statistical comparative analysis across **6 metric families**:
-
-- **Scale Consistency**: Detects key and tonal centers using the Krumhansl-Schmuckler algorithm and evaluates the in-key note ratio.
-- **Pitch Class Entropy**: Measures Shannon entropy across 12-bin pitch class histograms to assess pitch distribution variety vs structure.
-- **Pitch Range**: Calculates semitone spans between lowest and highest pitches across compositions.
-- **Polyphony Rate, Note Density & KL Divergence**: Computes average concurrent sounding notes and note rates, along with Kullback-Leibler (KL) divergence against validation distributions.
-- **Groove Consistency**: Analyzes Inter-Onset Interval (IOI) timing statistics and histograms to measure rhythmic flow.
-- **Structural Repetition & Compression**: Evaluates LZ77 (zlib) compression ratios of pitch-duration patterns to quantify structural coherence and repetition.
-
----
-
-
 
 ## Model Architecture Details
-
 
 | Parameter     | Value  | Description                   |
 | ------------- | ------ | ----------------------------- |
 | `vocab_size`  | ~2,048 | BPE Tokenizer Vocabulary      |
 | `d_model`     | 768    | Hidden Embedding Dimension    |
-| `nhead`       | 12     | Multi-Head Attention Heads    |
+| `nhead`       | 12     | Attention Heads               |
 | `num_layers`  | 24     | Transformer Decoder Blocks    |
-| `d_ff`        | 3,072  | SwiGLU Hidden Layer Dimension |
+| `d_ff`        | 3,072  | SwiGLU Hidden Dimension       |
 | `max_seq_len` | 4,096  | Context Window Length         |
 
+## Development
+
+```bash
+pytest                            # run the test suite (CPU-only, fast)
+ruff check src/ tests/            # lint
+```
 
 ---
 
-
-
 ## License
 
-This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the **MIT License** — see the [LICENSE](LICENSE) file for details.
