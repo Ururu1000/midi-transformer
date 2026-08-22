@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "musiclm"
+version = "0.1.0"
+description = "Composer-conditioned symbolic music generator: LLaMA-style transformer over BPE-compressed REMI tokens"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = [
+    "torch==2.8.0",
+    "miditok==3.0.6.post1",
+    "pretty_midi==0.2.11",
+    "scipy==1.13.1",
+    "numpy==2.0.2",
+    "pandas==2.3.3",
+    "tqdm==4.68.3",
+    "wandb==0.26.1",
+]
+
+[project.optional-dependencies]
+app = [
+    "gradio==4.36.0",
+    "gradio_client==1.0.1",
+    "huggingface-hub==0.24.7",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+musiclm-train = "musiclm.training.cli:main"
+musiclm-tokenize = "musiclm.data.preprocess:main"
+musiclm-generate = "musiclm.inference.cli:main"
+musiclm-batch = "musiclm.inference.batch:main"
+musiclm-eval = "musiclm.evaluation.cli:main"
+musiclm-app = "musiclm.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# BLE001: parsing/rendering third-party MIDI (pretty_midi, miditok, fluidsynth)
+# raises arbitrary exception types; catching Exception is intentional.
+ignore = ["BLE001"]
+
+[tool.ruff.lint.per-file-ignores]
+# gr.Progress() as a default argument is the standard Gradio idiom.
+"src/musiclm/app.py" = ["B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
