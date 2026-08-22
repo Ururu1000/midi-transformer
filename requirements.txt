@@ -1,0 +1,11 @@
+torch==2.8.0
+miditok==3.0.6.post1
+pretty_midi==0.2.11
+scipy==1.13.1
+numpy==2.0.2
+pandas==2.3.3
+tqdm==4.68.3
+wandb==0.26.1
+gradio==4.36.0
+gradio_client==1.0.1
+huggingface-hub==0.24.7

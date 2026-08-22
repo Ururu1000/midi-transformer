@@ -1,21 +1,28 @@
-/checkpoints
-/data/processed
-/venv/
+# Data & artifacts (downloaded or generated, never source-controlled)
+data/raw_midi/
 data/processed/
-*.pt
-*.pth
-/ai v4(new model).zip
+data/generated/
+checkpoints/
 wandb/
 
-# Local junk / secrets / tooling
-/Y/
+# Environments & tooling
+venv/
+.venv/
+.idea/
 .cursor/
+.vscode/
 **/__pycache__/
 *.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# OS junk
 .DS_Store
 **/.DS_Store
-/data/generated/
-upload_to_hf.py
-app.py
-requirements.txt
-.idea
+
+# Local archives
+/ai v4(new model).zip
+/Y/
