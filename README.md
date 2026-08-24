@@ -43,7 +43,6 @@ ai-music-project/
 ├── tests/                    # pytest suite (mask, packing, sampler, metrics, tokenizer)
 ├── scripts/
 │   ├── download_data.sh      # Fetch MAESTRO (+ GiantMIDI instructions)
-│   ├── tokenize_midi.py      # Shim -> musiclm-tokenize
 │   └── upload_to_hf.py       # Publish checkpoint/tokenizer to Hugging Face Hub
 ├── checkpoints/              # Trained weights (not source-controlled)
 └── data/                     # raw_midi / processed / generated (not source-controlled)

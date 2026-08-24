@@ -26,3 +26,13 @@ dist/
 # Local archives
 /ai v4(new model).zip
 /Y/
+
+# Deprecated local shims (kept on the author's machine, not published).
+# Use the installed CLIs instead: musiclm-{train,generate,batch,eval,app,tokenize}
+/train.py
+/generate.py
+/generate_batch.py
+/evaluate_advanced.py
+/app.py
+/model.py
+/scripts/tokenize_midi.py
