@@ -26,6 +26,9 @@ app = [
     "gradio_client==1.0.1",
     "huggingface-hub==0.24.7",
 ]
+audio = [
+    "lameenc>=1.7",
+]
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",

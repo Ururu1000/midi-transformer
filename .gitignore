@@ -2,6 +2,7 @@
 data/raw_midi/
 data/processed/
 data/generated/
+data/soundfonts/
 checkpoints/
 wandb/
 

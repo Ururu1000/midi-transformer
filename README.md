@@ -118,6 +118,25 @@ musiclm-batch --output-dir data/generated
 
 Play the `.mid` files in any MIDI player or DAW (Ableton, FL Studio, GarageBand).
 
+### MP3 export
+
+Add `--mp3` to keep the MIDI **and** get a ready-to-play MP3 next to it:
+
+```bash
+musiclm-generate --composer "Frédéric Chopin" --length 1024 --seed 42 --mp3
+# -> output.mid + output.mp3
+
+musiclm-batch --mp3                 # MP3 for every preset
+```
+
+Options: `--bitrate 192k` (default) · `--soundfont /path/to/font.sf2` (generate only).
+Rendering uses FluidSynth + the FluidR3_GM SoundFont for real piano sound; without them it falls back to sine waves. One-time setup:
+
+```bash
+bash scripts/setup_audio.sh        # brew install fluidsynth + download SoundFont (~140 MB)
+pip install -e '.[audio]'          # lameenc MP3 encoder (or use ffmpeg if installed)
+```
+
 ### 5. Interactive Web App
 
 ```bash

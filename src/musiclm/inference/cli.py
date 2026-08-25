@@ -30,6 +30,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--seed", type=int, default=None, help="Set for reproducible sampling"
     )
+    parser.add_argument(
+        "--mp3",
+        action="store_true",
+        help="Also render an MP3 next to the MIDI (MIDI is always kept)",
+    )
+    parser.add_argument("--bitrate", type=str, default="192k", help="MP3 bitrate")
+    parser.add_argument("--soundfont", type=Path, default=None, help="Path to a .sf2 file")
     return parser
 
 
@@ -59,7 +66,16 @@ def main(argv: list[str] | None = None) -> None:
         ),
         seed=args.seed,
     )
-    run_generation(cfg)
+    midi_path = run_generation(cfg)
+
+    if args.mp3:
+        from musiclm.audio import convert_midi_to_mp3
+
+        convert_midi_to_mp3(
+            midi_path,
+            bitrate=args.bitrate,
+            soundfont=args.soundfont,
+        )
 
 
 if __name__ == "__main__":

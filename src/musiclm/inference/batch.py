@@ -1,4 +1,3 @@
-"""Batch generation: preset-driven bulk sampling across composers."""
 from __future__ import annotations
 
 import argparse
@@ -59,6 +58,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--tokenizer", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=GENERATED_DIR)
     parser.add_argument("--seed", type=int, default=None, help="Base seed; each preset adds its index")
+    parser.add_argument(
+        "--mp3",
+        action="store_true",
+        help="Also render an MP3 next to each MIDI (MIDI is always kept)",
+    )
+    parser.add_argument("--bitrate", type=str, default="192k", help="MP3 bitrate")
     args = parser.parse_args(argv)
 
     defaults = GenerateConfig()
@@ -99,6 +104,11 @@ def main(argv: list[str] | None = None) -> None:
         out_path = args.output_dir / f"{preset.name}.mid"
         tokens_to_midi_file(tokenizer, token_ids, out_path)
         logger.info("Saved %s (%d tokens)", out_path, len(token_ids))
+
+        if args.mp3:
+            from musiclm.audio import convert_midi_to_mp3
+
+            convert_midi_to_mp3(out_path, bitrate=args.bitrate)
 
     logger.info("Done. Files saved to %s/", args.output_dir)
 

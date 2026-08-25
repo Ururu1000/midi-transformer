@@ -16,6 +16,7 @@ DATA_DIR = PROJECT_ROOT / "data"
 RAW_MIDI_DIR = DATA_DIR / "raw_midi"
 MAESTRO_METADATA_PATH = RAW_MIDI_DIR / "maestro-v3.0.0.csv"
 GIANTMIDI_DIR = RAW_MIDI_DIR / "giantmidi"
+SOUNDFONT_DIR = DATA_DIR / "soundfonts"
 
 PROCESSED_DIR = DATA_DIR / "processed"
 TOKENIZER_PATH = PROCESSED_DIR / "tokenizer.json"
@@ -118,6 +119,13 @@ class GenerateConfig:
     # speed.
     use_kv_cache: bool = True
     seed: int | None = None
+
+    # Audio export: when True, an MP3 (bitrate) is rendered next to the MIDI;
+    # the MIDI file is always kept. Requires lameenc (`pip install -e '.[audio]'`)
+    # or ffmpeg; rendering uses FluidSynth + SoundFont when available
+    # (scripts/setup_audio.sh).
+    mp3: bool = False
+    bitrate: str = "192k"
 
 
 @dataclass(frozen=True)

@@ -305,7 +305,8 @@ def tokens_to_midi_file(
     logger.info("Saved generated MIDI to %s", output_path)
 
 
-def main(cfg: GenerateConfig | None = None) -> None:
+def main(cfg: GenerateConfig | None = None) -> Path:
+    """Generate one piece and save it as MIDI; returns the output path."""
     if cfg is None:
         cfg = GenerateConfig()
     logging.basicConfig(
@@ -351,6 +352,7 @@ def main(cfg: GenerateConfig | None = None) -> None:
     logger.info("Generated %d tokens", len(token_ids))
 
     tokens_to_midi_file(tokenizer, token_ids, cfg.output_path)
+    return Path(cfg.output_path)
 
 
 if __name__ == "__main__":
