@@ -71,6 +71,8 @@ def find_soundfont(explicit: str | os.PathLike[str] | None = None) -> Path | Non
 
 def _normalize(audio: np.ndarray) -> np.ndarray:
     """Scale to [-1, 1] with headroom so playback does not clip."""
+    if audio.size == 0:
+        return audio
     peak = float(np.abs(audio).max())
     if peak > 0:
         audio = audio / peak * 0.9
@@ -86,6 +88,7 @@ def render_midi_to_wav(
     """Render *midi_path* to a mono 16-bit WAV file; returns the engine used."""
     sf = find_soundfont(soundfont)
     fluidsynth_bin = shutil.which("fluidsynth")
+    wav_path.parent.mkdir(parents=True, exist_ok=True)
 
     if fluidsynth_bin is not None and sf is not None:
         # -n no shell, -i no stdin prompt, -g gain below clipping threshold.
@@ -124,7 +127,6 @@ def render_midi_to_wav(
     audio = _normalize(np.asarray(audio)).astype(np.float32)
     pcm = (audio * 32767.0).astype("<i2").tobytes()
 
-    wav_path.parent.mkdir(parents=True, exist_ok=True)
     with wave.open(str(wav_path), "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
