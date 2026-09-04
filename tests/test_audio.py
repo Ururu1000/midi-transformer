@@ -1,4 +1,7 @@
+import hashlib
+import io
 import math
+import tarfile
 import wave
 from pathlib import Path
 
@@ -7,13 +10,24 @@ import pytest
 
 lameenc = pytest.importorskip("lameenc", reason="pip install -e '.[audio]'")
 
+from musiclm import audio
 from musiclm.audio import (
     DEFAULT_BITRATE,
+    STUDIO_SOUNDFONT_NAME,
+    SoundFontDownloadError,
     convert_midi_to_mp3,
+    download_studio_soundfont,
     find_soundfont,
     render_midi_to_wav,
     wav_to_mp3,
 )
+
+
+@pytest.fixture(autouse=True)
+def disable_automatic_soundfont_download(monkeypatch):
+    """Unit tests never make network calls unless they mock the downloader."""
+    monkeypatch.setenv("MUSICLM_AUTO_DOWNLOAD_SOUNDFONT", "0")
+    monkeypatch.setattr(audio, "_auto_download_failed", False)
 
 
 def write_sine_wav(path: Path, seconds=0.5, freq=440.0, rate=44100) -> None:
@@ -37,6 +51,81 @@ def make_tiny_midi(path: Path) -> None:
         piano.notes.append(note)
     pm.instruments.append(piano)
     pm.write(str(path))
+
+
+def make_soundfont_archive() -> tuple[bytes, bytes]:
+    soundfont = b"RIFF" + (4).to_bytes(4, "little") + b"sfbk" + b"test"
+    archive_bytes = io.BytesIO()
+    with tarfile.open(fileobj=archive_bytes, mode="w:bz2") as archive:
+        member = tarfile.TarInfo(audio._STUDIO_SOUNDFONT_MEMBER)
+        member.size = len(soundfont)
+        archive.addfile(member, io.BytesIO(soundfont))
+    return archive_bytes.getvalue(), soundfont
+
+
+class FakeDownload(io.BytesIO):
+    def __init__(self, content: bytes):
+        super().__init__(content)
+        self.headers = {"Content-Length": str(len(content))}
+
+
+class TestStudioSoundfontDownload:
+    def test_downloads_verifies_and_caches(self, tmp_path, monkeypatch):
+        archive_bytes, soundfont = make_soundfont_archive()
+        monkeypatch.setattr(
+            audio,
+            "STUDIO_SOUNDFONT_SHA256",
+            hashlib.sha256(archive_bytes).hexdigest(),
+        )
+        monkeypatch.setattr(
+            audio.urllib.request,
+            "urlopen",
+            lambda request, timeout: FakeDownload(archive_bytes),
+        )
+
+        result = download_studio_soundfont(tmp_path)
+
+        assert result == tmp_path / STUDIO_SOUNDFONT_NAME
+        assert result.read_bytes() == soundfont
+        assert not list(tmp_path.glob(".*"))
+
+        monkeypatch.setattr(
+            audio.urllib.request,
+            "urlopen",
+            lambda request, timeout: pytest.fail("cached SoundFont downloaded again"),
+        )
+        assert download_studio_soundfont(tmp_path) == result
+
+    def test_rejects_bad_checksum_and_removes_temporary_files(
+        self, tmp_path, monkeypatch
+    ):
+        archive_bytes, _ = make_soundfont_archive()
+        monkeypatch.setattr(audio, "STUDIO_SOUNDFONT_SHA256", "0" * 64)
+        monkeypatch.setattr(
+            audio.urllib.request,
+            "urlopen",
+            lambda request, timeout: FakeDownload(archive_bytes),
+        )
+
+        with pytest.raises(SoundFontDownloadError, match="checksum mismatch"):
+            download_studio_soundfont(tmp_path)
+
+        assert list(tmp_path.iterdir()) == []
+
+    def test_auto_download_precedes_generic_soundfont(self, tmp_path, monkeypatch):
+        studio = tmp_path / STUDIO_SOUNDFONT_NAME
+        generic = tmp_path / "FluidR3_GM.sf2"
+        generic.write_bytes(b"RIFF" + (4).to_bytes(4, "little") + b"sfbk")
+        monkeypatch.setattr(audio, "SOUNDFONT_DIR", tmp_path)
+        monkeypatch.setenv("MUSICLM_AUTO_DOWNLOAD_SOUNDFONT", "1")
+
+        def fake_download(destination_dir=None):
+            studio.write_bytes(b"RIFF" + (4).to_bytes(4, "little") + b"sfbk")
+            return studio
+
+        monkeypatch.setattr(audio, "download_studio_soundfont", fake_download)
+
+        assert find_soundfont(auto_download=True) == studio
 
 
 class TestWavToMp3:

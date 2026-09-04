@@ -130,12 +130,22 @@ musiclm-batch --mp3                 # MP3 for every preset
 ```
 
 Options: `--bitrate 192k` (default) · `--soundfont /path/to/font.sf2` (generate only).
-Rendering uses FluidSynth + the FluidR3_GM SoundFont for real piano sound; without them it falls back to sine waves. One-time setup:
+Rendering uses FluidSynth with the studio-recorded **FreePats YDP Grand Piano**. The first
+`--mp3` render downloads its verified 35 MiB archive and caches the SF2 in
+`data/soundfonts/` (~113 MiB); later renders start immediately. Explicit `--soundfont` and
+`MUSICLM_SOUNDFONT` paths still take priority. Without FluidSynth, rendering falls back
+to sine waves.
 
 ```bash
-bash scripts/setup_audio.sh        # brew install fluidsynth + download SoundFont (~140 MB)
+bash scripts/setup_audio.sh        # install FluidSynth + prefetch studio SoundFont
 pip install -e '.[audio]'          # lameenc MP3 encoder (or use ffmpeg if installed)
 ```
+
+Set `MUSICLM_AUTO_DOWNLOAD_SOUNDFONT=0` to disable automatic downloads.
+[YDP Grand Piano](https://freepats.zenvoid.org/Piano/acoustic-grand-piano.html) was
+produced by Roberto/FreePats from Zenph Studios Yamaha Disklavier Pro samples recorded
+by Dr. Mikhail Krishtal and team; it is available under
+[CC BY 3.0](https://creativecommons.org/licenses/by/3.0/).
 
 ### 5. Interactive Web App
 

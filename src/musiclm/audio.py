@@ -10,11 +10,17 @@ MP3 encoding:
 """
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import logging
 import os
 import shutil
 import subprocess
+import tarfile
 import tempfile
+import threading
+import urllib.error
+import urllib.request
 import wave
 from pathlib import Path
 
@@ -25,6 +31,20 @@ from musiclm.config import SOUNDFONT_DIR
 
 SAMPLE_RATE = 44100
 DEFAULT_BITRATE = "192k"
+STUDIO_SOUNDFONT_NAME = "YDP-GrandPiano-20160804.sf2"
+STUDIO_SOUNDFONT_URL = (
+    "https://freepats.zenvoid.org/Piano/YDP-GrandPiano/"
+    "YDP-GrandPiano-SF2-20160804.tar.bz2"
+)
+STUDIO_SOUNDFONT_SHA256 = "d243dc3e182a60df2a16e92828c1821cf3eb5748b45e2e2bdcfa9cf7af056026"
+STUDIO_SOUNDFONT_LICENSE = "CC BY 3.0"
+_STUDIO_SOUNDFONT_MEMBER = (
+    "YDP-GrandPiano-SF2-20160804/YDP-GrandPiano-20160804.sf2"
+)
+_DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+_AUTO_DOWNLOAD_FALSE_VALUES = {"0", "false", "no", "off"}
+_soundfont_download_lock = threading.Lock()
+_auto_download_failed = False
 
 # Known system locations for soundfonts (brew on macOS, apt on Linux).
 _SYSTEM_SF2_DIRS = (
@@ -36,12 +56,133 @@ _SYSTEM_SF2_DIRS = (
 logger = logging.getLogger(__name__)
 
 
-def find_soundfont(explicit: str | os.PathLike[str] | None = None) -> Path | None:
+class SoundFontDownloadError(RuntimeError):
+    """Raised when the managed studio SoundFont cannot be installed safely."""
+
+
+def _is_valid_soundfont(path: Path) -> bool:
+    try:
+        with path.open("rb") as soundfont:
+            header = soundfont.read(12)
+    except OSError:
+        return False
+    return len(header) == 12 and header[:4] == b"RIFF" and header[8:12] == b"sfbk"
+
+
+def _auto_download_enabled() -> bool:
+    value = os.environ.get("MUSICLM_AUTO_DOWNLOAD_SOUNDFONT", "1")
+    return value.strip().lower() not in _AUTO_DOWNLOAD_FALSE_VALUES
+
+
+def download_studio_soundfont(destination_dir: Path | None = None) -> Path:
+    """Download, verify, and atomically install the FreePats YDP piano SF2.
+
+    YDP Grand Piano is built from Zenph Studios Yamaha Disklavier Pro samples
+    and published by FreePats under CC BY 3.0. The compressed archive is about
+    35 MiB; the extracted SoundFont is cached for all future renders.
+    """
+    destination_dir = Path(destination_dir or SOUNDFONT_DIR)
+    target = destination_dir / STUDIO_SOUNDFONT_NAME
+    if _is_valid_soundfont(target):
+        return target
+
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    archive_path: Path | None = None
+    extracted_path: Path | None = None
+
+    with _soundfont_download_lock:
+        if _is_valid_soundfont(target):
+            return target
+
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=".ydp-grand-piano-",
+                suffix=".tar.bz2",
+                dir=destination_dir,
+                delete=False,
+            ) as archive_file:
+                archive_path = Path(archive_file.name)
+                request = urllib.request.Request(
+                    STUDIO_SOUNDFONT_URL,
+                    headers={"User-Agent": "musiclm/0.1 SoundFont downloader"},
+                )
+                logger.info(
+                    "Downloading studio piano SoundFont from FreePats "
+                    "(35 MiB archive, first render only) ..."
+                )
+                digest = hashlib.sha256()
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    while chunk := response.read(_DOWNLOAD_CHUNK_SIZE):
+                        archive_file.write(chunk)
+                        digest.update(chunk)
+
+            actual_digest = digest.hexdigest()
+            if actual_digest != STUDIO_SOUNDFONT_SHA256:
+                raise SoundFontDownloadError(
+                    "Studio SoundFont checksum mismatch: "
+                    f"expected {STUDIO_SOUNDFONT_SHA256}, got {actual_digest}"
+                )
+
+            with tarfile.open(archive_path, mode="r:bz2") as archive:
+                try:
+                    member = archive.getmember(_STUDIO_SOUNDFONT_MEMBER)
+                except KeyError as exc:
+                    raise SoundFontDownloadError(
+                        "Studio SoundFont archive has no expected SF2 file"
+                    ) from exc
+                source = archive.extractfile(member)
+                if source is None:
+                    raise SoundFontDownloadError(
+                        "Studio SoundFont archive entry is not a regular file"
+                    )
+                with source, tempfile.NamedTemporaryFile(
+                    prefix=f".{STUDIO_SOUNDFONT_NAME}.",
+                    suffix=".part",
+                    dir=destination_dir,
+                    delete=False,
+                ) as extracted_file:
+                    extracted_path = Path(extracted_file.name)
+                    shutil.copyfileobj(source, extracted_file, _DOWNLOAD_CHUNK_SIZE)
+
+            if not _is_valid_soundfont(extracted_path):
+                raise SoundFontDownloadError(
+                    "Downloaded studio SoundFont has an invalid SF2 header"
+                )
+            os.replace(extracted_path, target)
+            extracted_path = None
+            logger.info(
+                "Installed %s (FreePats, %s) at %s",
+                STUDIO_SOUNDFONT_NAME,
+                STUDIO_SOUNDFONT_LICENSE,
+                target,
+            )
+            return target
+        except SoundFontDownloadError:
+            raise
+        except (OSError, tarfile.TarError, urllib.error.URLError) as exc:
+            raise SoundFontDownloadError(
+                f"Could not download studio SoundFont: {exc}"
+            ) from exc
+        finally:
+            if archive_path is not None:
+                archive_path.unlink(missing_ok=True)
+            if extracted_path is not None:
+                extracted_path.unlink(missing_ok=True)
+
+
+def find_soundfont(
+    explicit: str | os.PathLike[str] | None = None,
+    *,
+    auto_download: bool = False,
+) -> Path | None:
     """Locate a .sf2 file; explicit argument wins over env and system paths.
 
     Search order: explicit argument -> $MUSICLM_SOUNDFONT ->
-    data/soundfonts/*.sf2 -> known system directories.
+    managed studio piano -> data/soundfonts/*.sf2 -> known system directories.
+    When *auto_download* is true, install the managed piano if needed.
     """
+    global _auto_download_failed
+
     if explicit is not None:
         path = Path(explicit).expanduser()
         if not path.exists():
@@ -55,14 +196,36 @@ def find_soundfont(explicit: str | os.PathLike[str] | None = None) -> Path | Non
             return path
         logger.warning("$MUSICLM_SOUNDFONT=%s does not exist, ignoring", env_path)
 
+    studio_path = SOUNDFONT_DIR / STUDIO_SOUNDFONT_NAME
+    if _is_valid_soundfont(studio_path):
+        return studio_path
+
+    if auto_download and _auto_download_enabled() and not _auto_download_failed:
+        try:
+            return download_studio_soundfont()
+        except SoundFontDownloadError as exc:
+            _auto_download_failed = True
+            logger.warning(
+                "%s; using an installed SoundFont instead. Retry manually with "
+                "`download_studio_soundfont()` or disable attempts with "
+                "MUSICLM_AUTO_DOWNLOAD_SOUNDFONT=0.",
+                exc,
+            )
+
     if SOUNDFONT_DIR.exists():
-        candidates = sorted(SOUNDFONT_DIR.glob("*.sf2"))
+        candidates = sorted(
+            path
+            for path in SOUNDFONT_DIR.glob("*.sf2")
+            if _is_valid_soundfont(path)
+        )
         if candidates:
             return candidates[0]
 
     for directory in _SYSTEM_SF2_DIRS:
         if directory.exists():
-            candidates = sorted(directory.rglob("*.sf2"))
+            candidates = sorted(
+                path for path in directory.rglob("*.sf2") if _is_valid_soundfont(path)
+            )
             if candidates:
                 return candidates[0]
 
@@ -86,8 +249,12 @@ def render_midi_to_wav(
     soundfont: str | os.PathLike[str] | None = None,
 ) -> str:
     """Render *midi_path* to a mono 16-bit WAV file; returns the engine used."""
-    sf = find_soundfont(soundfont)
     fluidsynth_bin = shutil.which("fluidsynth")
+    pyfluidsynth_available = importlib.util.find_spec("fluidsynth") is not None
+    sf = find_soundfont(
+        soundfont,
+        auto_download=fluidsynth_bin is not None or pyfluidsynth_available,
+    )
     wav_path.parent.mkdir(parents=True, exist_ok=True)
 
     if fluidsynth_bin is not None and sf is not None:
