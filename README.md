@@ -1,3 +1,15 @@
+---
+license: mit
+tags:
+  - pytorch
+  - music-generation
+  - symbolic-music
+  - midi
+  - transformer
+  - autoregressive
+  - composer-conditioned
+---
+
 # Symbolic Music Language Model
 
 [License: MIT](LICENSE)
