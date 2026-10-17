@@ -9,3 +9,4 @@ wandb==0.26.1
 gradio==4.36.0
 gradio_client==1.0.1
 huggingface-hub==0.24.7
+pydantic==2.10.6
