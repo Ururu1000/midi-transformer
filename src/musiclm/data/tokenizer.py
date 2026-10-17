@@ -96,6 +96,8 @@ def encode_base_ids_batch(
     tokenizer: REMI,
     base_ids_batch: list[list[int]],
 ) -> list[list[int]]:
+    if not tokenizer.is_trained:
+        return [list(ids) for ids in base_ids_batch]
     sequences = [TokSequence(ids=list(ids)) for ids in base_ids_batch]
     tokenizer.encode_token_ids(sequences)
     return [list(sequence.ids) for sequence in sequences]
