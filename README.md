@@ -46,6 +46,9 @@ ai-music-project/
 │   │   └── cli.py            # musiclm-train entry point
 │   ├── inference/
 │   │   ├── sampler.py        # Generation engine (KV-cache, CFG, min-p, rep penalty)
+│   │   ├── priming.py        # Primers: opening bars of a real MIDI as a prompt
+│   │   ├── rerank.py         # Best-of-N scoring + musiclm-refstats
+│   │   ├── prompts.py        # Free-text prompt -> generation parameters
 │   │   ├── cli.py            # musiclm-generate entry point
 │   │   └── batch.py          # musiclm-batch preset runner
 │   ├── evaluation/
@@ -119,8 +122,29 @@ Sampling defaults (`src/musiclm/config.py::GenerateConfig`):
 | `temperature` | 0.92 | Sampling temperature |
 | `min_p` | 0.02 | Min-P confidence threshold |
 | `cfg_scale` | 1.2 | Classifier-Free Guidance strength (1.0 = off) |
-| `repetition_penalty` | 1.0 | Pitch-only repetition suppression (window 64) |
+| `repetition_penalty` | 1.15 | Pitch-only repetition suppression (window 64) |
 | `seed` | none | Set it for reproducible sampling |
+| `num_candidates` | 1 | Best-of-N: sample N pieces in one batch, keep the most realistic |
+| `prime_midi` / `prime_bars` | none / 4 | Seed with the opening bars of a real MIDI file |
+
+Best-of-N ranks candidates by how close their statistics (key consistency,
+density, polyphony, rhythm, repetition) are to real music by the same
+composer, and rejects stuck trills or octave loops. Build the reference
+statistics from MAESTRO once:
+
+```bash
+musiclm-refstats                  # -> data/processed/reference_stats.json
+musiclm-generate --composer "Frédéric Chopin" --candidates 4
+```
+
+Priming continues a real opening; the primer bars are cut from the output
+unless `--keep-primer` is set. Primed continuations can lock onto the
+primer's figuration, so pair priming with `--candidates`:
+
+```bash
+musiclm-generate --composer "Frédéric Chopin" --prime-midi opening.mid \
+                 --prime-bars 4 --candidates 4
+```
 
 Bulk A/B sampling across composers:
 
@@ -166,6 +190,8 @@ musiclm-app
 ```
 
 Gradio UI: pick a composer, tweak sliders, generate, preview audio, download MIDI.
+The **Candidates** slider enables best-of-N, and **Start from a real piece**
+takes a primer MIDI upload.
 
 ### 6. Quantitative Evaluation
 
