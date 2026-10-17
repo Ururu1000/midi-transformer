@@ -213,6 +213,74 @@ def _compression_ratio(notes: list[pretty_midi.Note]) -> float:
     return len(compressed) / len(raw) if len(raw) > 0 else 1.0
 
 
+WINDOW_FEATURES = (
+    "scale_consistency",
+    "pc_entropy",
+    "pitch_range",
+    "polyphony_rate",
+    "note_density",
+    "ioi_mean",
+    "compression_ratio",
+)
+
+
+def note_window_features(notes: Sequence[pretty_midi.Note]) -> dict[str, float]:
+    """Scalar metrics for one stretch of notes, keyed by ``WINDOW_FEATURES``.
+
+    Compression ratio depends on how many notes are compressed, so compare
+    windows holding similar note counts.
+    """
+    assert notes, "Need at least one note"
+    notes = list(notes)
+    pitches = [n.pitch for n in notes]
+    pch = _pitch_class_histogram(notes)
+    duration = _active_duration(notes)
+    root, mode = detect_key(pch)
+    ioi = _inter_onset_intervals(notes)
+    return {
+        "scale_consistency": scale_consistency(pitches, root, mode),
+        # Shannon entropy in nats, for consistency with the scipy-based KLDs.
+        "pc_entropy": float(scipy_entropy(pch + KL_EPSILON)),
+        "pitch_range": float(max(pitches) - min(pitches)),
+        "polyphony_rate": _polyphony_rate(notes, duration),
+        "note_density": len(notes) / duration if duration > 0.0 else 0.0,
+        "ioi_mean": float(ioi.mean()) if ioi.size > 0 else 0.0,
+        "compression_ratio": _compression_ratio(notes),
+    }
+
+
+def stuck_fraction(
+    notes: Sequence[pretty_midi.Note],
+    window_seconds: float = 4.0,
+    min_notes: int = 8,
+    max_distinct: int = 6,
+    max_top_share: float = 0.3,
+) -> float:
+    """Share of busy windows that circle a handful of pitches.
+
+    A window counts as stuck when it uses at most *max_distinct* pitches or
+    one pitch takes at least *max_top_share* of its onsets: trills and
+    octave pairs that run for seconds. Real MAESTRO Chopin scores about 0.03.
+    """
+    if not notes:
+        return 0.0
+    onsets = np.array(sorted((n.start, n.pitch) for n in notes))
+    start, end = onsets[0, 0], onsets[-1, 0]
+    busy = stuck = 0
+    for window_start in np.arange(start, end + window_seconds, window_seconds):
+        in_window = (onsets[:, 0] >= window_start) & (
+            onsets[:, 0] < window_start + window_seconds
+        )
+        pitches = onsets[in_window, 1].astype(int)
+        if pitches.size < min_notes:
+            continue
+        busy += 1
+        counts = np.bincount(pitches)
+        if np.count_nonzero(counts) <= max_distinct or counts.max() / pitches.size >= max_top_share:
+            stuck += 1
+    return stuck / busy if busy else 0.0
+
+
 def extract_file_metrics(midi_path: Path) -> FileMetrics | None:
     """Compute every metric for one MIDI file in a single parse."""
     midi = load_midi(midi_path)
@@ -224,40 +292,25 @@ def extract_file_metrics(midi_path: Path) -> FileMetrics | None:
         logger.warning("Skipping MIDI without pitched notes: %s", midi_path.name)
         return None
 
-    pitches = [n.pitch for n in notes]
+    features = note_window_features(notes)
     pch = _pitch_class_histogram(notes)
-    duration = _active_duration(notes)
-
     root, mode = detect_key(pch)
-    sc = scale_consistency(pitches, root, mode)
-
-    # Shannon entropy in nats, for consistency with the scipy-based KLDs.
-    pc_ent = float(scipy_entropy(pch + KL_EPSILON))
-
-    pr = max(pitches) - min(pitches)
-    poly = _polyphony_rate(notes, duration)
-    density = len(notes) / duration if duration > 0.0 else 0.0
-
     ioi = _inter_onset_intervals(notes)
-    ioi_mean = float(ioi.mean()) if ioi.size > 0 else 0.0
-    ioi_std = float(ioi.std()) if ioi.size > 0 else 0.0
-
-    cr = _compression_ratio(notes)
 
     return FileMetrics(
         path=midi_path,
         detected_key=f"{root} {mode}",
-        scale_consistency=sc,
-        pc_entropy=pc_ent,
-        pitch_range=pr,
-        polyphony_rate=poly,
-        note_density=density,
-        ioi_mean=ioi_mean,
-        ioi_std=ioi_std,
+        scale_consistency=features["scale_consistency"],
+        pc_entropy=features["pc_entropy"],
+        pitch_range=int(features["pitch_range"]),
+        polyphony_rate=features["polyphony_rate"],
+        note_density=features["note_density"],
+        ioi_mean=features["ioi_mean"],
+        ioi_std=float(ioi.std()) if ioi.size > 0 else 0.0,
         iois=ioi,
-        compression_ratio=cr,
+        compression_ratio=features["compression_ratio"],
         note_count=len(notes),
-        duration=duration,
+        duration=_active_duration(notes),
         pch=pch,
     )
 
