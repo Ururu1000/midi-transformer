@@ -24,6 +24,7 @@ COMPOSER_MAPPING_PATH = PROCESSED_DIR / "composer_mapping.json"
 TRAIN_TOKENS_PATH = PROCESSED_DIR / "tokens_train.pt"
 VAL_TOKENS_PATH = PROCESSED_DIR / "tokens_val.pt"
 UNIFIED_METADATA_PATH = PROCESSED_DIR / "unified_metadata.csv"
+REFERENCE_STATS_PATH = PROCESSED_DIR / "reference_stats.json"
 
 GENERATED_DIR = DATA_DIR / "generated"
 
@@ -106,9 +107,10 @@ class GenerateConfig:
     # Softened CFG (1.2 vs 1.5) restores composer steering without suppressing
     # secondary voices and outer registers.
     cfg_scale: float = 1.2
-    # Classical motifs reuse pitches; default off. Pitch-only window still
-    # available.
-    repetition_penalty: float = 1.0
+    # Without a penalty the model can lock into trills or octave pairs for
+    # minutes. 1.15 over a short pitch-only window breaks those loops while
+    # motifs can still return once they leave the window.
+    repetition_penalty: float = 1.15
     # Penalize against recent context only. A whole-sequence window makes every
     # pitch progressively unusable, which starves long generations of material.
     penalty_window: int = 64
@@ -119,6 +121,17 @@ class GenerateConfig:
     # speed.
     use_kv_cache: bool = True
     seed: int | None = None
+
+    # Optional MIDI whose first prime_bars bars (with notes) seed generation.
+    # The primer is real music, so only the continuation is saved unless
+    # keep_primer is set.
+    prime_midi: Path | None = None
+    prime_bars: int = 4
+    keep_primer: bool = False
+    # Best-of-N: sample this many candidates in one batch and keep the one
+    # whose statistics are closest to real music by the same composer
+    # (reference stats from `musiclm-refstats`).
+    num_candidates: int = 1
 
     # Audio export: when True, an MP3 (bitrate) is rendered next to the MIDI;
     # the MIDI file is always kept. Requires lameenc (`pip install -e '.[audio]'`)
