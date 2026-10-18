@@ -25,6 +25,9 @@ app = [
     "gradio==4.36.0",
     "gradio_client==1.0.1",
     "huggingface-hub==0.24.7",
+    # pydantic>=2.11 emits boolean JSON schemas that gradio_client 1.0.1 cannot
+    # parse, which breaks /info and shows "No API found" in the UI.
+    "pydantic==2.10.6",
 ]
 audio = [
     "lameenc>=1.7",
@@ -41,6 +44,7 @@ musiclm-generate = "musiclm.inference.cli:main"
 musiclm-batch = "musiclm.inference.batch:main"
 musiclm-eval = "musiclm.evaluation.cli:main"
 musiclm-app = "musiclm.app:main"
+musiclm-refstats = "musiclm.inference.rerank:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

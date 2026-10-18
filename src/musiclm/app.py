@@ -14,25 +14,34 @@ import json
 import logging
 import os
 import tempfile
+import wave
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import gradio as gr
 import numpy as np
-import pretty_midi
 import torch
 
+from musiclm.audio import render_midi_to_wav
 from musiclm.config import COMPOSER_MAPPING_PATH, TOKENIZER_PATH, GenerateConfig
 from musiclm.data.tokenizer import ComposerREMI, list_composer_tokens
-from musiclm.inference.sampler import generate, load_model, tokens_to_midi_file
+from musiclm.inference.prompts import parse_prompt
+from musiclm.inference.rerank import load_reference_stats
+from musiclm.inference.sampler import generate_piece, load_model, tokens_to_midi_file
 from musiclm.model import get_device
 
 DEFAULT_TEMPERATURE = 0.95
 DEFAULT_MIN_P = 0.03
 DEFAULT_CFG_SCALE = 1.2
-DEFAULT_REP_PENALTY = 1.0
+DEFAULT_REP_PENALTY = GenerateConfig.repetition_penalty
 DEFAULT_LENGTH = 1024
+DEFAULT_CANDIDATES = 1
+MAX_CANDIDATES = 4
+DEFAULT_PRIME_BARS = GenerateConfig.prime_bars
 SAMPLE_RATE = 44100
+# Share of the progress bar spent on token sampling; MIDI + audio take the rest.
+SAMPLING_PROGRESS = 0.85
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,6 +58,7 @@ class AppContext:
     model: torch.nn.Module
     tokenizer: ComposerREMI
     available_composers: list[str]
+    reference_stats: dict[str, Any] | None
 
 
 def load_resources(
@@ -82,28 +92,37 @@ def load_resources(
 
     logger.info("Available composers: %s", available_composers)
     return AppContext(device=device, model=model, tokenizer=tokenizer,
-                      available_composers=available_composers)
+                      available_composers=available_composers,
+                      reference_stats=load_reference_stats())
 
 
-def midi_to_audio(midi_path: Path, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
-    """Render a MIDI file to a mono float32 waveform.
+def midi_to_audio(
+    midi_path: Path, sample_rate: int = SAMPLE_RATE
+) -> tuple[int, np.ndarray]:
+    """Render a MIDI file with the studio grand-piano SoundFont.
 
-    Uses ``pretty_midi.fluidsynth()`` when FluidSynth + a SoundFont are
-    installed; otherwise falls back to ``synthesize()``, which produces
-    simple sine waves — good enough for a quick preview.
+    Delegates to :func:`musiclm.audio.render_midi_to_wav` (FluidSynth CLI +
+    YDP Grand Piano), so the preview matches ``musiclm-generate --mp3``.
+    Returns ``(sample_rate, audio)`` with audio shaped ``(frames, channels)``.
     """
-    pm = pretty_midi.PrettyMIDI(str(midi_path))
+    fd, name = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    wav_path = Path(name)
     try:
-        audio = pm.fluidsynth(fs=sample_rate)
-    except Exception:
-        logger.info("FluidSynth unavailable, falling back to sine synthesis")
-        audio = pm.synthesize(fs=sample_rate)
+        engine = render_midi_to_wav(midi_path, wav_path, sample_rate=sample_rate)
+        with wave.open(str(wav_path), "rb") as wf:
+            channels = wf.getnchannels()
+            rate = wf.getframerate()
+            pcm = wf.readframes(wf.getnframes())
+    finally:
+        wav_path.unlink(missing_ok=True)
+    logger.info("Audio preview rendered via %s", engine)
 
-    # Normalise to [-1, 1] so Gradio can play it without clipping.
-    peak = np.abs(audio).max()
+    audio = np.frombuffer(pcm, dtype="<i2").reshape(-1, channels).astype(np.float32)
+    peak = np.abs(audio).max() if audio.size else 0.0
     if peak > 0:
         audio = audio / peak * 0.9
-    return audio.astype(np.float32)
+    return rate, audio
 
 
 def generate_music(
@@ -115,26 +134,59 @@ def generate_music(
     repetition_penalty: float,
     length: int,
     progress: gr.Progress | None = None,
-) -> tuple[tuple[int, np.ndarray], Path]:
-    """Generate a new composition; return ((sample_rate, audio), midi_path)."""
+    candidates: int = DEFAULT_CANDIDATES,
+    primer_path: str | None = None,
+    prime_bars: int = DEFAULT_PRIME_BARS,
+    keep_primer: bool = False,
+) -> tuple[tuple[int, np.ndarray], Path, str]:
+    """Generate a new composition; return ((sample_rate, audio), midi_path, summary)."""
+    candidates = int(candidates)
+    desc = (
+        f"Generating {candidates} candidates…" if candidates > 1 else "Generating tokens…"
+    )
     if progress is not None:
-        progress(0.0, desc="Generating tokens…")
+        progress(0.0, desc=desc)
 
-    token_ids = generate(
+    def report(done: int, total: int) -> None:
+        if progress is not None:
+            progress(SAMPLING_PROGRESS * done / max(total, 1), desc=desc)
+
+    result = generate_piece(
         ctx.model,
         ctx.tokenizer,
         ctx.device,
-        length=int(length),
-        temperature=temperature,
+        int(length),
         composer=composer,
+        prime_midi=primer_path or None,
+        prime_bars=int(prime_bars),
+        keep_primer=keep_primer,
+        num_candidates=candidates,
+        reference_stats=ctx.reference_stats,
+        temperature=temperature,
         min_p=min_p,
         cfg_scale=cfg_scale,
         repetition_penalty=repetition_penalty,
+        progress_callback=report,
     )
+    token_ids = result.token_ids
     logger.info("Generated %d tokens for %s", len(token_ids), composer)
 
+    notes = []
+    if result.primer_tokens:
+        kept = "kept at the start" if keep_primer else "not included in the output"
+        notes.append(f"Primed with the first {int(prime_bars)} bars of your MIDI ({kept}).")
+    if result.scores:
+        ranked = ", ".join(
+            f"**{score:.2f}**" if i == result.chosen else f"{score:.2f}"
+            for i, score in enumerate(result.scores)
+        )
+        notes.append(
+            f"Kept candidate {result.chosen + 1} of {len(result.scores)} "
+            f"(distance from real {composer}, lower is better: {ranked})."
+        )
+
     if progress is not None:
-        progress(0.7, desc="Converting to MIDI…")
+        progress(SAMPLING_PROGRESS, desc="Converting to MIDI…")
 
     # delete=False: the file must survive until Gradio serves it; the UI
     # callback deletes it before the next generation.
@@ -146,9 +198,7 @@ def generate_music(
     if progress is not None:
         progress(0.9, desc="Rendering audio preview…")
 
-    audio = midi_to_audio(midi_path)
-
-    return (SAMPLE_RATE, audio), midi_path
+    return midi_to_audio(midi_path), midi_path, "\n\n".join(notes)
 
 
 DESCRIPTION = """\
@@ -183,24 +233,54 @@ def build_ui(ctx: AppContext) -> gr.Blocks:
         temp_files.clear()
 
     def generate_callback(
+        prompt_text: str,
         composer: str,
         temperature: float,
         min_p: float,
         cfg_scale: float,
         repetition_penalty: float,
         length: int,
+        candidates: int,
+        primer_path: str | None,
+        prime_bars: int,
+        keep_primer: bool,
         progress: gr.Progress = gr.Progress(),
     ) -> tuple:
         cleanup_temp_files()
-        (sample_rate, audio), midi_path = generate_music(
-            ctx, composer, temperature, min_p, cfg_scale,
-            repetition_penalty, length, progress,
-        )
+        interpretation = ""
+        if prompt_text and prompt_text.strip():
+            parsed = parse_prompt(prompt_text, ctx.available_composers)
+            if parsed.composer:
+                composer = parsed.composer
+            if parsed.length:
+                length = parsed.length
+            if parsed.temperature:
+                temperature = parsed.temperature
+            interpretation = parsed.interpretation
+        try:
+            (sample_rate, audio), midi_path, summary = generate_music(
+                ctx, composer, temperature, min_p, cfg_scale,
+                repetition_penalty, length, progress,
+                candidates=candidates,
+                primer_path=primer_path,
+                prime_bars=prime_bars,
+                keep_primer=keep_primer,
+            )
+        except ValueError as exc:
+            raise gr.Error(str(exc)) from exc
         temp_files.append(midi_path)
-        return (sample_rate, audio), str(midi_path)
+        details = "\n\n".join(part for part in (interpretation, summary) if part)
+        return (sample_rate, audio), str(midi_path), details
 
     with gr.Blocks(theme=theme, title="Music Generator") as app:
         gr.Markdown(DESCRIPTION)
+
+        prompt_box = gr.Textbox(
+            lines=2,
+            label="Prompt (optional)",
+            placeholder="Example: generate Chopin longer",
+        )
+        interpretation_md = gr.Markdown("")
 
         with gr.Row():
             # ── Left column: controls ────────────────────────────
@@ -251,6 +331,33 @@ def build_ui(ctx: AppContext) -> gr.Blocks:
                     label="Generation Length (tokens)",
                     info="Number of tokens to generate",
                 )
+                candidates_sl = gr.Slider(
+                    minimum=1,
+                    maximum=MAX_CANDIDATES,
+                    value=DEFAULT_CANDIDATES,
+                    step=1,
+                    label="Candidates (best-of-N)",
+                    info="Generate several pieces at once and keep the one "
+                    "closest to the real composer; slower",
+                )
+                with gr.Accordion("Start from a real piece (optional)", open=False):
+                    primer_file = gr.File(
+                        label="Primer MIDI",
+                        file_types=[".mid", ".midi"],
+                        type="filepath",
+                    )
+                    prime_bars_sl = gr.Slider(
+                        minimum=1,
+                        maximum=16,
+                        value=DEFAULT_PRIME_BARS,
+                        step=1,
+                        label="Primer bars",
+                        info="Opening bars (with notes) fed to the model",
+                    )
+                    keep_primer_cb = gr.Checkbox(
+                        value=False,
+                        label="Keep primer bars in the output",
+                    )
                 generate_btn = gr.Button(
                     "🎹 Generate",
                     variant="primary",
@@ -271,14 +378,19 @@ def build_ui(ctx: AppContext) -> gr.Blocks:
         generate_btn.click(
             fn=generate_callback,
             inputs=[
+                prompt_box,
                 composer_dd,
                 temperature_sl,
                 min_p_sl,
                 cfg_sl,
                 rep_pen_sl,
                 length_sl,
+                candidates_sl,
+                primer_file,
+                prime_bars_sl,
+                keep_primer_cb,
             ],
-            outputs=[audio_out, midi_out],
+            outputs=[audio_out, midi_out, interpretation_md],
         )
 
     return app
