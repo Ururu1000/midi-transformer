@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from musiclm.config import GenerateConfig
+from musiclm.config import GenerateConfig, with_overrides
 from musiclm.inference.sampler import main as run_generation
 
 
@@ -70,7 +70,6 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
 
-    defaults = GenerateConfig()
     parsed = None
     if args.prompt:
         from musiclm.inference.prompts import load_available_composers, parse_prompt
@@ -80,43 +79,30 @@ def main(argv: list[str] | None = None) -> None:
             load_available_composers(tokenizer_path=args.tokenizer),
         )
         print(parsed.interpretation)
-    cfg = GenerateConfig(
-        checkpoint_path=args.checkpoint or defaults.checkpoint_path,
-        tokenizer_path=args.tokenizer or defaults.tokenizer_path,
-        output_path=args.output or defaults.output_path,
-        composer=args.composer
-        if args.composer is not None
-        else (parsed.composer if parsed and parsed.composer else defaults.composer),
-        length=args.length
-        if args.length is not None
-        else (parsed.length if parsed and parsed.length else defaults.length),
-        temperature=(
-            args.temperature
-            if args.temperature is not None
-            else (
-                parsed.temperature
-                if parsed and parsed.temperature
-                else defaults.temperature
-            )
-        ),
-        min_p=args.min_p if args.min_p is not None else defaults.min_p,
-        cfg_scale=args.cfg_scale if args.cfg_scale is not None else defaults.cfg_scale,
-        repetition_penalty=(
-            args.repetition_penalty
-            if args.repetition_penalty is not None
-            else defaults.repetition_penalty
-        ),
-        penalty_window=(
-            args.penalty_window if args.penalty_window is not None
-            else defaults.penalty_window
-        ),
+
+    def flag_or_prompt(flag: object, field: str) -> object:
+        # Explicit flags win over anything parsed from --prompt.
+        if flag is not None or parsed is None:
+            return flag
+        return getattr(parsed, field)
+
+    cfg = with_overrides(
+        GenerateConfig(),
+        checkpoint_path=args.checkpoint,
+        tokenizer_path=args.tokenizer,
+        output_path=args.output,
+        composer=flag_or_prompt(args.composer, "composer"),
+        length=flag_or_prompt(args.length, "length"),
+        temperature=flag_or_prompt(args.temperature, "temperature"),
+        min_p=args.min_p,
+        cfg_scale=args.cfg_scale,
+        repetition_penalty=args.repetition_penalty,
+        penalty_window=args.penalty_window,
         seed=args.seed,
         prime_midi=args.prime_midi,
-        prime_bars=args.prime_bars if args.prime_bars is not None else defaults.prime_bars,
+        prime_bars=args.prime_bars,
         keep_primer=args.keep_primer,
-        num_candidates=(
-            args.candidates if args.candidates is not None else defaults.num_candidates
-        ),
+        num_candidates=args.candidates,
     )
     midi_path = run_generation(cfg)
 
