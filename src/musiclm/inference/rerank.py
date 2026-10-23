@@ -41,6 +41,7 @@ from musiclm.evaluation.metrics import (
     note_window_features,
     stuck_fraction,
 )
+from musiclm.hub import resolve_release_file
 from musiclm.inference.priming import drop_primer
 
 ALL_COMPOSERS = "__all__"
@@ -124,6 +125,10 @@ def build_reference_stats(
 
 
 def load_reference_stats(path: Path = REFERENCE_STATS_PATH) -> dict[str, Any] | None:
+    try:
+        path = resolve_release_file(path)
+    except Exception as exc:
+        logger.warning("Could not download reference stats: %s", exc)
     if not path.exists():
         logger.warning(
             "No reference stats at %s; best-of-N ranks by stuck stretches only. "
