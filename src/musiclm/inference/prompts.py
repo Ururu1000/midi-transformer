@@ -9,10 +9,13 @@ from CLI flags or UI sliders. No retraining involved.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # Russian aliases (including common inflections) keyed by normalized latin
 # last name. Latin forms are matched generically; this table only adds
@@ -188,14 +191,25 @@ def load_available_composers(
     mapping_path: Path | None = None,
     tokenizer_path: Path | None = None,
 ) -> list[str]:
-    """Composer display names, preferring the mapping file over the tokenizer."""
+    """Composer display names, preferring the mapping file over the tokenizer.
+
+    Default paths missing locally are fetched from the Hub; when that fails
+    too, the tokenizer vocabulary is the fallback.
+    """
     from musiclm.config import COMPOSER_MAPPING_PATH, TOKENIZER_PATH
+    from musiclm.hub import resolve_release_file
 
     mapping = Path(mapping_path) if mapping_path else COMPOSER_MAPPING_PATH
+    try:
+        mapping = resolve_release_file(mapping)
+    except Exception as exc:
+        logger.warning("Could not download the composer mapping: %s", exc)
     if mapping.exists():
-        with open(mapping) as fh:
+        with open(mapping, encoding="utf-8") as fh:
             return list(json.load(fh).get("top_composers", []))
-    tok_path = Path(tokenizer_path) if tokenizer_path else TOKENIZER_PATH
+    tok_path = resolve_release_file(
+        Path(tokenizer_path) if tokenizer_path else TOKENIZER_PATH
+    )
     if not tok_path.exists():
         return []
     from musiclm.data.tokenizer import ComposerREMI, list_composer_tokens
