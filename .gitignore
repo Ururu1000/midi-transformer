@@ -1,4 +1,4 @@
-# Data & artifacts (downloaded or generated, never source-controlled)
+# Data & artifacts 
 data/raw_midi/
 data/processed/
 data/generated/
@@ -24,12 +24,14 @@ dist/
 .DS_Store
 **/.DS_Store
 
+# Personal documents kept next to the repo
+/*.docx
+
 # Local archives
 /ai v4(new model).zip
 /Y/
 
-# Deprecated local shims (kept on the author's machine, not published).
-# Use the installed CLIs instead: musiclm-{train,generate,batch,eval,app,tokenize}
+# Deprecated local shims 
 /train.py
 /generate.py
 /generate_batch.py
