@@ -6,11 +6,11 @@ Launch locally (after ``pip install -e '.[app]'``):
 Deploy to Hugging Face Spaces:
     1. Create a new Space (Gradio SDK) at huggingface.co/new-space
     2. Push this repo and set the app entry point to musiclm.app:main
-    3. Upload model_best.pt and tokenizer.json via scripts/upload_to_hf.py.
+    3. Publish the weights and tokenizer with scripts/upload_to_hf.py; the app
+       downloads them from the Hub on first start.
 """
 from __future__ import annotations
 
-import json
 import logging
 import os
 import tempfile
@@ -24,29 +24,31 @@ import numpy as np
 import torch
 
 from musiclm.audio import render_midi_to_wav
-from musiclm.config import COMPOSER_MAPPING_PATH, TOKENIZER_PATH, GenerateConfig
-from musiclm.data.tokenizer import ComposerREMI, list_composer_tokens
-from musiclm.inference.prompts import parse_prompt
+from musiclm.config import TOKENIZER_PATH, GenerateConfig
+from musiclm.data.tokenizer import ComposerREMI
+from musiclm.inference.prompts import load_available_composers, parse_prompt
 from musiclm.inference.rerank import load_reference_stats
-from musiclm.inference.sampler import generate_piece, load_model, tokens_to_midi_file
+from musiclm.inference.sampler import (
+    generate_piece,
+    load_model,
+    load_tokenizer,
+    tokens_to_midi_file,
+)
 from musiclm.model import get_device
 
-DEFAULT_TEMPERATURE = 0.95
-DEFAULT_MIN_P = 0.03
-DEFAULT_CFG_SCALE = 1.2
+# Slider defaults match the CLI (GenerateConfig is the single source).
+DEFAULT_TEMPERATURE = GenerateConfig.temperature
+DEFAULT_MIN_P = GenerateConfig.min_p
+DEFAULT_CFG_SCALE = GenerateConfig.cfg_scale
 DEFAULT_REP_PENALTY = GenerateConfig.repetition_penalty
-DEFAULT_LENGTH = 1024
-DEFAULT_CANDIDATES = 1
+DEFAULT_LENGTH = GenerateConfig.length
+DEFAULT_CANDIDATES = GenerateConfig.num_candidates
 MAX_CANDIDATES = 4
 DEFAULT_PRIME_BARS = GenerateConfig.prime_bars
 SAMPLE_RATE = 44100
 # Share of the progress bar spent on token sampling; MIDI + audio take the rest.
 SAMPLING_PROGRESS = 0.85
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 
@@ -65,30 +67,17 @@ def load_resources(
     checkpoint_path: Path = GenerateConfig.checkpoint_path,
     tokenizer_path: Path = TOKENIZER_PATH,
 ) -> AppContext:
-    """Load the model and tokenizer, and build the composer list."""
+    """Load the model and tokenizer, and build the composer list.
+
+    Default files missing locally are downloaded from the Hub, so the app also
+    runs on a fresh clone or a Hugging Face Space.
+    """
     device = get_device()
     logger.info("Device: %s", device)
 
-    tokenizer = ComposerREMI(params=str(tokenizer_path))
-    logger.info(
-        "Loaded tokenizer from %s | vocab_size=%d | bpe=%s",
-        tokenizer_path,
-        len(tokenizer),
-        tokenizer.is_trained,
-    )
-
+    tokenizer = load_tokenizer(tokenizer_path)
     model = load_model(checkpoint_path, device)
-
-    # Build composer dropdown from the mapping file or tokenizer vocabulary.
-    if COMPOSER_MAPPING_PATH.exists():
-        with open(COMPOSER_MAPPING_PATH) as fh:
-            mapping = json.load(fh)
-        available_composers = list(mapping.get("top_composers", []))
-    else:
-        available_composers = [
-            t.replace("Composer_", "").replace("_", " ")
-            for t in list_composer_tokens(tokenizer)
-        ]
+    available_composers = load_available_composers(tokenizer_path=tokenizer_path)
 
     logger.info("Available composers: %s", available_composers)
     return AppContext(device=device, model=model, tokenizer=tokenizer,
@@ -397,6 +386,10 @@ def build_ui(ctx: AppContext) -> gr.Blocks:
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     ctx = load_resources()
     app = build_ui(ctx)
     app.launch(share=False)
