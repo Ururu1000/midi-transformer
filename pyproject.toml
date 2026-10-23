@@ -18,13 +18,16 @@ dependencies = [
     "pandas==2.3.3",
     "tqdm==4.68.3",
     "wandb==0.26.1",
+    # Downloads the released checkpoint/tokenizer when missing locally, and
+    # reads/writes the safetensors inference export.
+    "huggingface-hub==0.24.7",
+    "safetensors==0.6.2",
 ]
 
 [project.optional-dependencies]
 app = [
     "gradio==4.36.0",
     "gradio_client==1.0.1",
-    "huggingface-hub==0.24.7",
     # pydantic>=2.11 emits boolean JSON schemas that gradio_client 1.0.1 cannot
     # parse, which breaks /info and shows "No API found" in the UI.
     "pydantic==2.10.6",
@@ -45,6 +48,7 @@ musiclm-batch = "musiclm.inference.batch:main"
 musiclm-eval = "musiclm.evaluation.cli:main"
 musiclm-app = "musiclm.app:main"
 musiclm-refstats = "musiclm.inference.rerank:main"
+musiclm-export = "musiclm.checkpoint:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
