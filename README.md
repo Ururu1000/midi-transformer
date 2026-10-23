@@ -37,6 +37,8 @@ ai-music-project/
 ├── src/musiclm/
 │   ├── config.py             # Paths + ModelConfig / TrainConfig / GenerateConfig
 │   ├── model.py              # MusicTransformer (RoPE, SwiGLU, RMSNorm, KV-cache)
+│   ├── checkpoint.py         # Checkpoint loading + safetensors export (musiclm-export)
+│   ├── hub.py                # Downloads released weights/tokenizer when missing locally
 │   ├── data/
 │   │   ├── tokenizer.py      # ComposerREMI + vocabulary helpers (miditok adapter)
 │   │   ├── preprocess.py     # Dataset prep: metadata, filters, BPE training, tokenization
@@ -55,10 +57,11 @@ ai-music-project/
 │   │   ├── metrics.py        # Statistical metrics suite
 │   │   └── cli.py            # musiclm-eval entry point
 │   └── app.py                # Gradio web UI (musiclm-app)
-├── tests/                    # pytest suite (mask, packing, sampler, metrics, tokenizer)
+├── tests/                    # pytest suite (model, data, sampler, trainer, CLIs, metrics)
+├── .github/workflows/ci.yml  # ruff + pytest on every push / PR
 ├── scripts/
 │   ├── download_data.sh      # Fetch MAESTRO (+ GiantMIDI instructions)
-│   └── upload_to_hf.py       # Publish checkpoint/tokenizer to Hugging Face Hub
+│   └── upload_to_hf.py       # Publish weights/tokenizer to Hugging Face Hub
 ├── checkpoints/              # Trained weights (not source-controlled)
 └── data/                     # raw_midi / processed / generated (not source-controlled)
 ```
@@ -95,7 +98,7 @@ This produces `data/processed/tokens_train.pt`, `tokens_val.pt` and the tokenize
 ### 3. Training
 
 ```bash
-musiclm-train                     # resume_mode=weights by default
+musiclm-train                     # resume_mode=weights by default (from scratch if no checkpoint yet)
 ```
 
 Useful flags:
@@ -106,7 +109,9 @@ musiclm-train --resume-mode full                # restore optimizer/scheduler/RN
 musiclm-train --no-wandb                        # disable experiment tracking
 ```
 
-Defaults (overridable via CLI): `pack_seq_len` 4096 · batch 8 × 16 accumulation = effective 128 · LR 2e-4 cosine with 5 warmup epochs · CFG dropout 15% · early-stop patience 5. Metrics log to Weights & Biases automatically.
+Defaults (overridable via CLI): `pack_seq_len` 4096 · batch 8 × 16 accumulation = effective 128 · LR 2e-4, per-step linear warmup over 5 epochs then cosine to 10% · weight decay on weight matrices only · CFG dropout 15% · early-stop patience 5. Metrics log to Weights & Biases automatically.
+
+Each epoch checkpoint carries optimizer state, so only the newest two `model_epoch_*.pt` files are kept (`keep_last_checkpoints` in `TrainConfig`); `model_best.pt` is never pruned. Checkpoints also store the model architecture, so inference rebuilds the right model from any of them.
 
 ### 4. Music Generation
 
@@ -115,7 +120,11 @@ musiclm-generate --composer "Frédéric Chopin" --length 1024 --seed 42 \
                  --output data/generated/chopin.mid
 ```
 
-Sampling defaults (`src/musiclm/config.py::GenerateConfig`):
+On a fresh clone (no local checkpoint or tokenizer), the released weights, tokenizer and
+metadata are downloaded from the [Hugging Face Hub](https://huggingface.co/sagevoice/music-transformer-classical)
+on first use. Set `HF_HUB_OFFLINE=1` to stay offline.
+
+Sampling defaults (`src/musiclm/config.py::GenerateConfig`; the web app and `musiclm-batch` use the same values):
 
 | Parameter | Default | Meaning |
 |---|---|---|
@@ -220,6 +229,17 @@ Compares generated vs validation corpora across **6 metric families**:
 | `num_layers`  | 24     | Transformer Decoder Blocks    |
 | `d_ff`        | 3,072  | SwiGLU Hidden Dimension       |
 | `max_seq_len` | 4,096  | Context Window Length         |
+
+### 7. Publishing Weights
+
+```bash
+musiclm-export                    # -> checkpoints/export/model.safetensors + config.json
+python scripts/upload_to_hf.py    # export + upload weights, tokenizer and metadata
+```
+
+The export holds inference weights only (bfloat16 by default, about a sixth of a training
+checkpoint, no pickle). `--checkpoint` accepts either format. Add
+`--include-training-state` to the upload to also publish the full training checkpoint.
 
 ## Development
 
