@@ -6,8 +6,9 @@ entry points work from any working directory.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any, TypeVar
 
 # src/musiclm/config.py -> repo root is three levels up.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -30,6 +31,11 @@ GENERATED_DIR = DATA_DIR / "generated"
 
 CHECKPOINTS_DIR = PROJECT_ROOT / "checkpoints"
 DEFAULT_CHECKPOINT_PATH = CHECKPOINTS_DIR / "model_best.pt"
+EXPORT_DIR = CHECKPOINTS_DIR / "export"
+
+# Released checkpoint, tokenizer and metadata. Inference downloads them from
+# here when the default local files are missing (e.g. on a fresh clone).
+HF_REPO_ID = "sagevoice/music-transformer-classical"
 
 
 @dataclass(frozen=True)
@@ -57,7 +63,11 @@ class TrainConfig:
     local_batch_size: int = 1
     gradient_accumulation_steps: int = 16
     num_epochs: int = 50
+    # The LR follows a per-optimizer-step schedule: linear warmup across the
+    # first warmup_epochs worth of steps, then cosine decay to
+    # min_lr_ratio * learning_rate by the final epoch.
     warmup_epochs: int = 5
+    min_lr_ratio: float = 0.1
     learning_rate: float = 2e-4
     weight_decay: float = 0.02
     max_grad_norm: float = 1.0
@@ -80,8 +90,13 @@ class TrainConfig:
     # Resume policy: "none" trains from scratch, "weights" loads model weights
     # plus epoch/step counters but keeps optimizer/scheduler/scaler fresh,
     # "full" restores every training state from the latest epoch checkpoint.
+    # Both resume modes fall back to training from scratch when no checkpoint
+    # exists yet, so a fresh clone can train with the defaults.
     resume_mode: str = "weights"  # "none" | "weights" | "full"
     resume_checkpoint_path: Path = DEFAULT_CHECKPOINT_PATH
+    # Each epoch checkpoint carries optimizer state (~2 GB at default size);
+    # only the newest few are kept. model_best.pt is never pruned.
+    keep_last_checkpoints: int = 2
 
     use_wandb: bool = True
     wandb_project: str = "ai-music-project"
@@ -151,6 +166,18 @@ PITCH_PREFIXES = ("Pitch", "PitchDrum")
 # Tokens that carry the rhythmic grid. Penalizing these starves the model of
 # the bar/beat vocabulary it must reuse constantly, which collapses timing.
 GRID_PREFIXES = ("Bar", "Position", "TimeShift", "Rest", "Chord", "Tempo")
+
+
+ConfigT = TypeVar("ConfigT")
+
+
+def with_overrides(defaults: ConfigT, **overrides: Any) -> ConfigT:
+    """Copy of *defaults* with every override that is not ``None`` applied.
+
+    CLI flags default to ``None`` meaning "not given", so only flags the user
+    actually passed replace config values.
+    """
+    return replace(defaults, **{k: v for k, v in overrides.items() if v is not None})
 
 
 def model_config_dict(cfg: ModelConfig) -> dict[str, int]:
