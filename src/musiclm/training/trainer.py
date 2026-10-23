@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import logging
+import math
 import random
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,7 @@ import wandb
 from torch import Tensor, nn
 from torch.utils.data import DataLoader
 
+from musiclm.checkpoint import strip_compile_prefix
 from musiclm.config import (
     CHECKPOINTS_DIR,
     TOKENIZER_PATH,
@@ -35,6 +37,11 @@ from musiclm.data.tokenizer import (
 from musiclm.model import MusicTransformer, get_device
 
 CHECKPOINT_PATTERN = re.compile(r"model_epoch_(\d+)\.pt$")
+# Checkpoints record which LR schedule produced their scheduler state; older
+# ones stepped once per epoch and cannot be loaded into the per-step schedule.
+SCHEDULER_KIND = "per_step_warmup_cosine"
+# Warmup starts at this fraction of the peak learning rate.
+WARMUP_START_FACTOR = 0.1
 
 # L4 24GB: seq 4096 attention is ~4x seq 2048. The block-diagonal attn_mask
 # routes SDPA to the memory-efficient backend (flash kernels reject arbitrary
@@ -89,11 +96,7 @@ def get_model_state_dict(model: nn.Module) -> dict[str, Any]:
 
 def load_model_state_dict(model: nn.Module, state_dict: dict[str, Any]) -> None:
     """Load weights into a raw or compiled model; strip `_orig_mod.` if present."""
-    cleaned = {
-        (key.removeprefix("_orig_mod.")): value
-        for key, value in state_dict.items()
-    }
-    unwrap_model(model).load_state_dict(cleaned)
+    unwrap_model(model).load_state_dict(strip_compile_prefix(state_dict))
 
 
 def capture_rng_state() -> dict[str, Any]:
@@ -195,18 +198,65 @@ def load_datasets(
     return train_dataset, val_dataset, vocab_size, pad_token_id
 
 
-def find_latest_checkpoint(checkpoints_dir: Path) -> Path | None:
-    latest_epoch = -1
-    latest_path: Path | None = None
+def list_epoch_checkpoints(checkpoints_dir: Path) -> list[tuple[int, Path]]:
+    """(epoch, path) of every ``model_epoch_*.pt``, oldest first."""
+    found: list[tuple[int, Path]] = []
     for path in checkpoints_dir.glob("model_epoch_*.pt"):
         match = CHECKPOINT_PATTERN.search(path.name)
-        if match is None:
-            continue
-        epoch = int(match.group(1))
-        if epoch > latest_epoch:
-            latest_epoch = epoch
-            latest_path = path
-    return latest_path
+        if match is not None:
+            found.append((int(match.group(1)), path))
+    return sorted(found)
+
+
+def find_latest_checkpoint(checkpoints_dir: Path) -> Path | None:
+    checkpoints = list_epoch_checkpoints(checkpoints_dir)
+    return checkpoints[-1][1] if checkpoints else None
+
+
+def prune_epoch_checkpoints(checkpoints_dir: Path, keep: int) -> None:
+    """Delete all but the newest *keep* epoch checkpoints; ``keep < 1`` keeps all."""
+    if keep < 1:
+        return
+    for _, path in list_epoch_checkpoints(checkpoints_dir)[:-keep]:
+        path.unlink()
+        logger.info("Removed old checkpoint %s", path)
+
+
+def build_param_groups(model: nn.Module, weight_decay: float) -> list[dict[str, Any]]:
+    """Decay weight matrices only; RMSNorm gains and biases (ndim < 2) are exempt."""
+    decay: list[nn.Parameter] = []
+    no_decay: list[nn.Parameter] = []
+    # parameters() yields the tied embedding/lm_head tensor once.
+    for param in model.parameters():
+        if param.requires_grad:
+            (decay if param.ndim >= 2 else no_decay).append(param)
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
+
+def lr_multiplier(
+    step: int, warmup_steps: int, total_steps: int, min_lr_ratio: float
+) -> float:
+    """Linear warmup to 1.0, then cosine decay to *min_lr_ratio*."""
+    if step < warmup_steps:
+        return WARMUP_START_FACTOR + (1.0 - WARMUP_START_FACTOR) * step / warmup_steps
+    progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+
+def build_scheduler(
+    optimizer: torch.optim.Optimizer, cfg: TrainConfig, steps_per_epoch: int
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Per-optimizer-step schedule; epochs only set the warmup and total lengths."""
+    warmup_steps = cfg.warmup_epochs * steps_per_epoch
+    total_steps = cfg.num_epochs * steps_per_epoch
+    return torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lambda step: lr_multiplier(step, warmup_steps, total_steps, cfg.min_lr_ratio),
+    )
 
 
 def save_checkpoint(
@@ -218,7 +268,8 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     scaler: torch.amp.GradScaler,
-    vocab_size: int,
+    model_config: ModelConfig,
+    seed: int,
     pad_token_id: int,
     best_val_loss: float,
     wandb_run_id: str | None = None,
@@ -227,12 +278,14 @@ def save_checkpoint(
         "epoch": epoch,
         "global_step": global_step,
         "model_state_dict": get_model_state_dict(model),
+        "model_config": asdict(model_config),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
+        "scheduler_kind": SCHEDULER_KIND,
         "scaler_state_dict": scaler.state_dict(),
         "rng_state": capture_rng_state(),
-        "seed": 42,
-        "vocab_size": vocab_size,
+        "seed": seed,
+        "vocab_size": model_config.vocab_size,
         "pad_token_id": pad_token_id,
         "best_val_loss": best_val_loss,
         "wandb_run_id": wandb_run_id,
@@ -265,7 +318,10 @@ def resume_weights_only(
 ) -> tuple[int, int, float, str | None]:
     """Load model weights and loop counters; optimizer must stay fresh."""
     if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Resume checkpoint not found: {checkpoint_path}")
+        logger.warning(
+            "Resume checkpoint %s not found, training from scratch", checkpoint_path
+        )
+        return 0, 0, float("inf"), None
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
     load_model_state_dict(model, checkpoint["model_state_dict"])
@@ -295,6 +351,7 @@ def resume_from_checkpoint(
     scaler: torch.amp.GradScaler,
     device: torch.device,
     batches_per_epoch: int,
+    steps_per_epoch: int,
 ) -> tuple[int, int, float, str | None]:
     if checkpoint_path is None or not checkpoint_path.exists():
         logger.warning("No checkpoint found, training from scratch")
@@ -302,21 +359,25 @@ def resume_from_checkpoint(
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
     load_model_state_dict(model, checkpoint["model_state_dict"])
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    try:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    except ValueError as exc:
+        # Checkpoints from before the decay/no-decay split have one param group.
+        logger.warning("Optimizer state not restored (%s); keeping fresh AdamW", exc)
 
     completed_epochs, global_step, best_val_loss, wandb_run_id = _read_checkpoint_counters(
         checkpoint, batches_per_epoch
     )
 
-    if "scheduler_state_dict" in checkpoint:
+    if checkpoint.get("scheduler_kind") == SCHEDULER_KIND:
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
     else:
+        completed_steps = completed_epochs * steps_per_epoch
         logger.warning(
-            "Checkpoint missing scheduler_state_dict; advancing scheduler %d steps",
-            completed_epochs,
+            "Checkpoint has no per-step scheduler state; advancing scheduler %d steps",
+            completed_steps,
         )
-        for _ in range(completed_epochs):
-            scheduler.step()
+        advance_scheduler(scheduler, completed_steps)
 
     if "scaler_state_dict" in checkpoint:
         scaler.load_state_dict(checkpoint["scaler_state_dict"])
@@ -379,6 +440,7 @@ def init_wandb(
             "effective_batch_size": effective_batch_size,
             "num_epochs": cfg.num_epochs,
             "warmup_epochs": cfg.warmup_epochs,
+            "min_lr_ratio": cfg.min_lr_ratio,
             "learning_rate": cfg.learning_rate,
             "weight_decay": cfg.weight_decay,
             "max_grad_norm": cfg.max_grad_norm,
@@ -411,6 +473,7 @@ def train_one_epoch(
     model: nn.Module,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
     scaler: torch.amp.GradScaler,
     device: torch.device,
     pad_token_id: int,
@@ -447,7 +510,10 @@ def train_one_epoch(
             )
 
         # Scale so accumulated gradients match the mean over the effective batch.
-        scaler.scale(loss / cfg.gradient_accumulation_steps).backward()
+        # The last window of an epoch may be shorter than the accumulation size.
+        window_start = step - step % cfg.gradient_accumulation_steps
+        window_size = min(cfg.gradient_accumulation_steps, num_batches - window_start)
+        scaler.scale(loss / window_size).backward()
 
         # Step on every Nth batch, and always flush on the final batch so the
         # last (possibly partial) accumulation window is not dropped.
@@ -464,6 +530,7 @@ def train_one_epoch(
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
+            scheduler.step()
 
         batch_loss = loss.item()
         total_loss += batch_loss
@@ -482,6 +549,7 @@ def train_one_epoch(
                     "train/batch_loss": batch_loss,
                     "train/epoch": epoch,
                     "train/batch": step + 1,
+                    "train/lr": scheduler.get_last_lr()[0],
                 }
                 if grad_norm is not None:
                     metrics["train/grad_norm"] = grad_norm
@@ -598,15 +666,13 @@ def main(cfg: TrainConfig | None = None) -> None:
     )
 
     batches_per_epoch = len(train_loader)
+    steps_per_epoch = math.ceil(batches_per_epoch / cfg.gradient_accumulation_steps)
 
     model_config = ModelConfig(vocab_size=vocab_size, dropout=cfg.dropout)
     model_kwargs = model_config_dict(model_config)
 
     # Build model first; weights-only resume loads weights before a fresh optimizer.
-    model: nn.Module = MusicTransformer(
-        vocab_size=vocab_size,
-        dropout=cfg.dropout,
-    ).to(device)
+    model: nn.Module = MusicTransformer.from_config(model_config).to(device)
     num_params_m = unwrap_model(model).get_num_params()
     logger.info("Model parameters: %.2fM", num_params_m)
 
@@ -628,29 +694,14 @@ def main(cfg: TrainConfig | None = None) -> None:
         logger.info("resume_mode='full'; full state resume including optimizer")
 
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        build_param_groups(model, cfg.weight_decay),
         lr=cfg.learning_rate,
-        weight_decay=cfg.weight_decay,
         fused=device.type == "cuda",
     )
-    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=0.1,
-        end_factor=1.0,
-        total_iters=cfg.warmup_epochs,
-    )
-    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=max(1, cfg.num_epochs - cfg.warmup_epochs),
-    )
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[cfg.warmup_epochs],
-    )
+    scheduler = build_scheduler(optimizer, cfg, steps_per_epoch)
 
     if cfg.resume_mode == "weights":
-        advance_scheduler(scheduler, completed_epochs)
+        advance_scheduler(scheduler, completed_epochs * steps_per_epoch)
         logger.info(
             "Fresh AdamW (wd=%.2f) and scheduler aligned to epoch %d | LR %.2e",
             cfg.weight_decay,
@@ -667,6 +718,7 @@ def main(cfg: TrainConfig | None = None) -> None:
             scaler,
             device,
             batches_per_epoch,
+            steps_per_epoch,
         )
     else:
         logger.info("resume_mode='none', training from randomly initialized weights")
@@ -698,6 +750,7 @@ def main(cfg: TrainConfig | None = None) -> None:
                 model,
                 train_loader,
                 optimizer,
+                scheduler,
                 scaler,
                 device,
                 pad_token_id,
@@ -716,7 +769,6 @@ def main(cfg: TrainConfig | None = None) -> None:
                 amp_dtype,
                 use_amp,
             )
-            scheduler.step()
             current_lr = scheduler.get_last_lr()[0]
 
             logger.info(
@@ -746,12 +798,14 @@ def main(cfg: TrainConfig | None = None) -> None:
                 optimizer=optimizer,
                 scheduler=scheduler,
                 scaler=scaler,
-                vocab_size=vocab_size,
+                model_config=model_config,
+                seed=cfg.seed,
                 pad_token_id=pad_token_id,
                 best_val_loss=min(best_val_loss, val_loss),
                 wandb_run_id=wandb_run_id,
             )
             logger.info("Saved checkpoint to %s", checkpoint_path)
+            prune_epoch_checkpoints(CHECKPOINTS_DIR, cfg.keep_last_checkpoints)
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -765,7 +819,8 @@ def main(cfg: TrainConfig | None = None) -> None:
                     optimizer=optimizer,
                     scheduler=scheduler,
                     scaler=scaler,
-                    vocab_size=vocab_size,
+                    model_config=model_config,
+                    seed=cfg.seed,
                     pad_token_id=pad_token_id,
                     best_val_loss=best_val_loss,
                     wandb_run_id=wandb_run_id,
